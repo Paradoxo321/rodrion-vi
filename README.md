@@ -8,118 +8,116 @@
 </p>
 
 > [!CAUTION]
-> **⚠️ NENHUM ARQUIVO DE JOGO ESTÁ INCLUÍDO / NO GAME FILES INCLUDED**
+> **⚠️ NO GAME FILES INCLUDED**
 >
-> Este repositório contém **apenas o código-fonte da camada de compatibilidade, scripts e launcher**. Nenhum executável, asset, shader, textura ou dado proprietário de jogo é distribuído aqui. **Cada usuário deve fornecer sua própria cópia legalmente obtida** e configurar os caminhos localmente em `victory.toml` (baseado em `victory.example.toml`).
->
-> *No game files, dumps, logs, or proprietary assets are included. You must supply your own legally obtained copy.*
+> This repository contains **only the source code for the compatibility layer, launch scripts, and launcher**. No executables, assets, shaders, textures, logs, or proprietary game data are distributed here. **Every user must supply their own legally obtained copy** and configure local paths in `victory.toml` (copied from `victory.example.toml`).
 
 ---
 
-## Médias de Teste Reais (RX 6600 8 GB + Ryzen 5 4500)
+## Real-World Benchmarks (RX 6600 8 GB + Ryzen 5 4500)
 
-Testado em **Windows 11**, **AMD Radeon RX 6600 8 GB** (Above 4G Decoding + **SAM / ReBAR** ativados, `TiledResourcesTier = 4`, RDNA 2 Wave64 nativo), **AMD Ryzen 5 4500 (6C/12T, 8 MB L3)** e **16 GB DDR4** — modo **Series S + FSR 2.4 (720p)**:
+Tested on **Windows 11**, **AMD Radeon RX 6600 8 GB** (**Above 4G Decoding + SAM / ReBAR enabled**, `TiledResourcesTier = 4`, native RDNA 2 Wave64), **AMD Ryzen 5 4500 (6C/12T, 8 MB L3)**, and **16 GB DDR4** — **Series S + FSR 2.4 (720p)** mode:
 
-| Métrica | Resultado Medido (Mundo Aberto) | Observações |
+| Metric | Measured Result (Open World) | Notes |
 |---|---|---|
-| **FPS real (cenas ~2.000–4.300 draws)** | **4.5 – 5.9 FPS** (`168 – 222 ms/frame`) | Limitado pela CPU (Ryzen 5 4500); menu em **28.5 FPS** (`35 ms`) |
-| **FPS real (cenas densas ~5.000–6.000 draws)** | **3.8 – 4.9 FPS** (`205 – 263 ms/frame`) | Antes das otimizações + SAM: `2.6 – 2.8 FPS` (`352 – 381 ms`) |
-| **Fluidez com AMD FSR FrameGen** | **~8 – 12 FPS exibidos** | Usa a folga da RX 6600 sem perda de FPS real |
-| **Tempo na GPU (RX 6600)** | **4.7 – 15.7 ms/frame** (~51% uso) | Shaders RDNA nativos (`rdna=true`, `compute=64`) |
-| **VRAM (RX 6600 8 GB)** | **5.5 GB / 6.7 GB** (~1.2 GB livre) | **0 evictions/s** (antes: 182 evictions/s e 52 GB de re-uploads) |
-| **Tiled Physical-Page Pool (`VICTORY_TILED_POOL=1`)** | **739–822 janelas (3.5–4.2 GB virtuais) em ~1.15 GB físicos** | **50.5% de RAM economizada** em *NULL hole tiles*, sem `device removed` |
-| **Offload GPU com SAM/ReBAR (`rebar_hw=true`)** | **239 cópias (1.110 MB) em VRAM** • **380 hash + 125 compare passes/frame na GPU** | Comparação na CPU caiu **87%** (`17.3 MB` → `2.2 MB`; buffers na CPU: `0.0 MB`) |
+| **Real FPS (~2,000–4,300 draws/frame)** | **4.5 – 5.9 FPS** (`168 – 222 ms/frame`) | CPU-bound on Ryzen 5 4500; pause menu at **28.5 FPS** (`35 ms`) |
+| **Real FPS (heavy ~5,000–6,000 draws/frame)** | **3.8 – 4.9 FPS** (`205 – 263 ms/frame`) | Before optimizations + SAM: `2.6 – 2.8 FPS` (`352 – 381 ms`) |
+| **Perceived fluidity with AMD FSR FrameGen** | **~8 – 12 displayed FPS** | Uses RX 6600 headroom with no loss of real FPS |
+| **GPU time (RX 6600)** | **4.7 – 15.7 ms/frame** (~51% busy) | Native RDNA shaders (`rdna=true`, `compute=64`) |
+| **VRAM usage (RX 6600 8 GB)** | **5.5 GB / 6.7 GB** (~1.2 GB free) | **0 evictions/s** (previously 182 evictions/s & 52 GB re-uploads) |
+| **Tiled Physical-Page Pool (`VICTORY_TILED_POOL=1`)** | **739–822 windows (3.5–4.2 GB virtual) in ~1.15 GB physical** | **50.5% RAM saved** via `NULL` hole tiles, zero `device removed` |
+| **GPU offload with SAM/ReBAR (`rebar_hw=true`)** | **239 copies (1,110 MB) in VRAM** • **380 hash + 125 compare passes/frame on GPU** | CPU write-compare cut by **87%** (`17.3 MB` → `2.2 MB`; CPU buffers: `0.0 MB`) |
 
 ---
 
-## Principais Melhorias nesta Edição
+## Key Improvements in This Edition
 
-### 1. Memória Unificada — Tiled Physical-Page Pool (`VICTORY_TILED_POOL=1`)
-- Usa **`CreateReservedResource` + `UpdateTileMappings`** sobre *chunks* de 64 MiB em `D3D12_HEAP_TYPE_CUSTOM (L0, Write-Back)` com mapeamento CPU persistente.
-- Espelha páginas físicas de 64 KiB do console (`xmem`) diretamente nos *tiles* D3D12, economizando **~50% de RAM** em buracos esparsos (`NULL tiles` = 0 bytes) com *refcount* seguro e descarte diferido (`host::retire`).
-- Invalidação por faixa de endereço (`VIEW_LOG` ring-buffer em `inplace.rs`), evitando re-escaneamento global em cada `MapView`/`UnmapView`.
-- Barreira VEH lock-free em `xmem.rs` para remapeamentos concorrentes sem *access violations*.
+### 1. Unified Memory — Tiled Physical-Page Pool (`VICTORY_TILED_POOL=1`)
+- Uses **`CreateReservedResource` + `UpdateTileMappings`** backed by 64 MiB `D3D12_HEAP_TYPE_CUSTOM (L0, Write-Back)` chunks with persistent CPU `Map()`.
+- Maps console 64 KiB physical pages (`xmem`) directly to D3D12 tiles, saving **~50% RAM** on sparse holes (`NULL` tiles = 0 bytes) with per-page reference counting and deferred retirement (`host::retire`).
+- Range-based mapping invalidation (`VIEW_LOG` ring buffer in `inplace.rs`), eliminating unnecessary global rescans on unrelated `MapView`/`UnmapView` calls.
+- Lock-free VEH transit barrier in `xmem.rs` for safe concurrent page remaps without access violations.
 
-### 2. Aproveitamento Completo de AMD SAM / ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
-- Uploads dinâmicos de até **32 MiB** vão direto para a VRAM GDDR6 via PCIe BAR (sem dupla cópia em RAM) quando **Above 4G Decoding + Resizable BAR / SAM** estão ativados na BIOS.
-- Combina `VICTORY_CARD_WINDOWS_MB=512` + `VICTORY_CARD_BUFFERS_MIN_KB=256` (hash e comparação via **Compute Shaders na GPU**) com o **Tiled Pool** para o restante das janelas.
-- Gestão calibrada de VRAM para placas de 8 GB (`VICTORY_VRAM_IDLE_MS=3000`, `VICTORY_TEXTURE_SHORT_SIDE=128`, `VICTORY_TEXTURE_CATCHUP=1`), eliminando *eviction thrashing* de texturas.
+### 2. Full AMD SAM / ReBAR Utilization (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
+- Dynamic buffer and texture uploads up to **32 MiB** write directly into GDDR6 VRAM over PCIe BAR (zero extra RAM staging copy) when **Above 4G Decoding + Resizable BAR / SAM** are enabled in BIOS.
+- Combines `VICTORY_CARD_WINDOWS_MB=512` + `VICTORY_CARD_BUFFERS_MIN_KB=256` (GPU compute shader hashing & comparison) with the **Tiled Pool** for remaining windows.
+- Tuned 8 GB VRAM management (`VICTORY_VRAM_IDLE_MS=3000`, `VICTORY_TEXTURE_SHORT_SIDE=128`, `VICTORY_TEXTURE_CATCHUP=1`) to eliminate texture eviction thrashing.
 
-### 3. Tradutor de Shaders RDNA Nativo (`YukiRyuu/VIctory-7900XT`)
-- Detecção automática de GPUs AMD RDNA (`set_host_rdna(true)`, Wave64 nativo + `VICTORY_RDNA_FLOAT` emitindo `v_max_f32`, `v_mul_legacy_f32`, `v_med3_f32`, `v_fract_f32` em 1 instrução).
-- Correções de *QuadRead* com *helper lanes* (remove artefatos em pintura, vidro e pele na AMD), índices de primitiva de 9 bits em *mesh shaders* e paridade 100% entre pré-compilação offline e execução em tempo real (`pipeline/host.rs`).
-- Proteção contra `device removed` em *root views* extensas (`VICTORY_ROOT_WINDOW_MB=12`).
+### 3. Native RDNA Shader Translator (`YukiRyuu/VIctory-7900XT`)
+- Automatic AMD RDNA detection (`set_host_rdna(true)`, native Wave64 + `VICTORY_RDNA_FLOAT` emitting single-instruction `v_max_f32`, `v_mul_legacy_f32`, `v_med3_f32`, `v_fract_f32`).
+- `QuadRead` helper-lane fixes (resolves artifacts on paint, glass, and skin on AMD), 9-bit mesh primitive indices, and 100% fingerprint parity between offline shader pre-compilation and runtime (`pipeline/host.rs`).
+- Extended root-view windowing (`VICTORY_ROOT_WINDOW_MB=12`) preventing `device removed` faults.
 
-### 4. Otimizações de CPU (Hot Paths)
-- **Hash rápido de texturas (`fast_hash64` 4 vias `u64`):** substitui `BLAKE3` criptográfico na detecção de mudança de texturas (~6–8x mais rápido) + `VICTORY_TEXTURE_HASH_EVERY=32`.
-- **Pool persistente (`wide_run`)** no refresh de texturas (`texture.rs`), no `find_all` de janelas Tiled (`shadow.rs`) e em lotes no `Batch::flush` (`host.rs`).
-- **`back_piece` e `changed_runs` vetorizados (32/8 bytes)** sem *zero-fills* redundantes.
+### 4. CPU Hot-Path Optimizations
+- **Fast 4-lane `u64` texture hashing (`fast_hash64`):** replaces cryptographic `BLAKE3` for texture change detection (~6–8x faster) + configurable `VICTORY_TEXTURE_HASH_EVERY=32`.
+- **Persistent worker pool (`wide_run`)** for texture refreshes (`texture.rs`), parallel Tiled Pool `find_all` comparisons (`shadow.rs`), and coarse-chunked `Batch::flush` (`host.rs`).
+- **Vectorized `back_piece` & `changed_runs` (32/8-byte skips)** without redundant zero-fills.
 
-### 5. Launcher Gráfico, Controles e Qualidade de Vida (`launcher/Program.cs`)
-- **Mapeamento customizável Xbox → Teclado (`VICTORY_KEYMAP`):** interface interativa para remapear todos os 24 botões/eixos do Xbox (ex.: `X = K`) com resolução automática de conflitos.
-- **Câmera no Mouse (`VICTORY_MOUSE_CAMERA=1`)** com sensibilidade ajustável, inversão de eixo Y e botões de mira/tiro (`F9` pausa/libera o mouse).
-- **Cursor oculto ao clicar na janela do jogo** (`lifecycle.rs`), reaparecendo automaticamente com `F9` ou `Alt+Tab`.
-- **Toggle Memória Unificada vs Modo Clássico AMD** (`-NoUnifiedMemory`) e **Modo Gráfico Leve / Lite** (`-LiteGraphics`, `VICTORY_LITE_GFX=1`, `VICTORY_AMBIENT=0.2`).
-- Suporte a **AMD FSR 2.4** e **AMD FSR Frame Generation** (FidelityFX SDK 2.4).
+### 5. Custom Launcher, Controls & Quality of Life (`launcher/Program.cs`)
+- **Customizable Xbox → Keyboard remapper (`VICTORY_KEYMAP`):** interactive UI to rebind all 24 Xbox buttons/axes (e.g. `X = K`) with automatic conflict resolution.
+- **Mouse Camera (`VICTORY_MOUSE_CAMERA=1`)** with adjustable sensitivity, Y-axis invert, and aim/shoot mouse button presets (`F9` toggles mouse capture).
+- **Click-to-hide mouse cursor** inside the game window (`lifecycle.rs`), automatically restored on `F9` or `Alt+Tab`.
+- **Unified Memory vs Classic AMD Mode toggle** (`-NoUnifiedMemory`) and **Lite Graphics Mode** (`-LiteGraphics`, `VICTORY_LITE_GFX=1`, `VICTORY_AMBIENT=0.2`).
+- Support for **AMD FSR 2.4** and **AMD FSR Frame Generation** (FidelityFX SDK 2.4).
 
 ---
 
-## Como Compilar e Rodar
+## Build & Run
 
-### Pré-requisitos
-- **Windows 11** + **Rust** (toolchain em `rust-toolchain.toml`)
-- GPU DirectX 12 com Shader Model 6.6 e Tiled Resources Tier 3/4 (recomendado: **Above 4G Decoding + SAM/ReBAR ativados na BIOS**).
-- Sua própria cópia legalmente obtida dos arquivos do título, fora da pasta deste repositório.
+### Prerequisites
+- **Windows 11** + **Rust** (toolchain specified in `rust-toolchain.toml`)
+- DirectX 12 GPU with Shader Model 6.6 and Tiled Resources Tier 3/4 (recommended: **Above 4G Decoding + SAM/ReBAR enabled in BIOS**).
+- Your own legally obtained game files stored **outside** this repository.
 
-### 1. Configurar caminhos locais
-Copie `victory.example.toml` para `victory.toml` (ignorado pelo Git) e aponte `game_dir`, `cache_dir` e `data_dir` para suas pastas locais (sempre **fora** do repositório).
+### 1. Configure Local Paths
+Copy `victory.example.toml` to `victory.toml` (git-ignored) and set `game_dir`, `cache_dir`, and `data_dir` to your local directories (always outside the repository).
 
-### 2. Compilar o `victory.exe`
+### 2. Build `victory.exe`
 ```powershell
 cargo build --release --bin victory
 ```
 
-### 3. (Opcional) Compilar o Launcher Windows Forms
+### 3. (Optional) Build the Windows Forms Launcher
 ```powershell
 & 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe' /nologo /target:winexe /optimize+ `
   /out:GTA6-Launcher.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll launcher\Program.cs
 ```
-*(Ajuste os caminhos no topo de `run-klbf-lab39.ps1` e `launcher\Program.cs` para o diretório da sua instalação.)*
+*(Update the local directory paths at the top of `run-klbf-lab39.ps1` and `launcher\Program.cs` to match your setup.)*
 
-### 4. Pré-compilar os Shaders (recomendado na primeira vez)
+### 4. Pre-Compile Shaders (Recommended First Run)
 ```powershell
 $env:VICTORY_CONFIG = ".\victory.toml"
 $env:VICTORY_SHADER_OPT = "0"
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
-.\target\release\victory.exe translate --cache --pipelines --jobs 8 "<sua_pasta_do_jogo>\shaders.rpf"
+.\target\release\victory.exe translate --cache --pipelines --jobs 8 "<your_game_dir>\shaders.rpf"
 ```
 
-### 5. Executar
+### 5. Launch
 ```powershell
 .\run-klbf-lab39.ps1 -Res720p
-# Com AMD FSR Frame Generation:
+# With AMD FSR Frame Generation:
 .\run-klbf-lab39.ps1 -FrameGen -Res720p
-# Modo Clássico AMD (sem Tiled Pool / UMA):
+# Classic AMD Mode (without Tiled Pool / UMA):
 .\run-klbf-lab39.ps1 -Res720p -NoUnifiedMemory
 ```
 
 ---
 
-## Referências, Créditos e Licença
+## References, Credits & License
 
-Este projeto é um fork experimental de **VIctory** sob licença **GPL-3.0** (veja [LICENSE](LICENSE)), construindo sobre o trabalho incrível da comunidade:
+This project is an experimental fork of **VIctory** licensed under **GPL-3.0** (see [LICENSE](LICENSE)), building upon work from the community:
 
-- **Upstream VIctory** & **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — base de renderização, tradução D3D12.X e melhorias de texturas/view-heap.
-- **[PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab)** / **[klbf-lab-beta](https://github.com/PastiiJay/klbf-lab-beta)** (Lab 39) — física de água, menus/HUD Series S, FSR Frame Generation, pré-compilação resumível de pipelines e correções AMD.
-- **[YukiRyuu/VIctory-7900XT](https://github.com/YukiRyuu/VIctory-7900XT)** — tradutor de shaders RDNA nativo (`set_host_rdna`, `VICTORY_RDNA_FLOAT`, QuadRead helper lanes, mesh 9-bit), `root_window` (`VICTORY_ROOT_WINDOW_MB`) e otimizações AMD.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)** — `VICTORY_DYNAMIC_SLOTS`, `VICTORY_MERGE_DWORDS`, `VICTORY_PIPELINE_GATE_S`, mips parciais e divisão de dispatches >65.535 grupos.
+- **Upstream VIctory** & **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — core D3D12.X translation, rendering, and texture/view-heap work.
+- **[PastiiJay/klbf-lab](https://github.com/PastiiJay/klbf-lab)** / **[klbf-lab-beta](https://github.com/PastiiJay/klbf-lab-beta)** (Lab 39) — water physics, Series S menus/HUD, FSR Frame Generation, resumable pipeline pre-build, and AMD fixes.
+- **[YukiRyuu/VIctory-7900XT](https://github.com/YukiRyuu/VIctory-7900XT)** — native RDNA shader translator (`set_host_rdna`, `VICTORY_RDNA_FLOAT`, QuadRead helper lanes, 9-bit mesh indices), `root_window` (`VICTORY_ROOT_WINDOW_MB`), and AMD optimizations.
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)** — `VICTORY_DYNAMIC_SLOTS`, `VICTORY_MERGE_DWORDS`, `VICTORY_PIPELINE_GATE_S`, partial mip streaming, and >65,535-group dispatch splitting.
 - **[GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)** — AMD FidelityFX SDK 2.4 (FSR + Frame Generation).
-- **rorodev6 / shadowdog00** — presets `VICTORY_LATE_WAIT=3`, `VICTORY_TEXTURE_BATCH` e `VICTORY_GROUPED_MESH_CLAMP`.
-- **ShakiraRED** — `VICTORY_COPY_PLAIN`, `VICTORY_WRITE_PLAIN` e `VICTORY_STAGING_POOL`.
-- **Trexies** — `VICTORY_CLAMP_WAITS=0` (eliminação de stalls UAV nos indirect clamps).
-- **triippywhale** — clamp do view-heap AMD e alocação dinâmica de slots.
-- **Geckomacabre/vx-layer** & **MiamiGame/XTP** (tabelas do `addrlib` do Mesa) — física de água e modos XOR swizzle.
+- **rorodev6 / shadowdog00** — `VICTORY_LATE_WAIT=3`, `VICTORY_TEXTURE_BATCH`, and `VICTORY_GROUPED_MESH_CLAMP`.
+- **ShakiraRED** — `VICTORY_COPY_PLAIN`, `VICTORY_WRITE_PLAIN`, and `VICTORY_STAGING_POOL`.
+- **Trexies** — `VICTORY_CLAMP_WAITS=0` (removing global UAV stalls on indirect clamps).
+- **triippywhale** — AMD view-heap clamping and dynamic descriptor slot scaling.
+- **Geckomacabre/vx-layer** & **MiamiGame/XTP** (Mesa `addrlib` tables) — ocean water physics and XOR swizzle addressing.
 - **Belobug/VIctory-Belobug-AMD** — `ambient.rs` (`VICTORY_AMBIENT`).
-- **JappertjeV**, **PalmVIDev**, **avatarmanz**, **ka1qux**, **clems206** — diagnósticos e correções integradas ao código.
+- **JappertjeV**, **PalmVIDev**, **avatarmanz**, **ka1qux**, **clems206** — diagnostics and upstream fixes.
 
-> Nomes de produtos e marcas são mencionados apenas para indicar compatibilidade e pertencem aos seus respectivos proprietários. **Nenhum arquivo de jogo é incluído neste repositório.**
+> Product names and trademarks are referenced solely to describe compatibility and belong to their respective owners. **No game files are included in this repository.**
