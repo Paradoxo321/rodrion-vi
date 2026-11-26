@@ -8283,12 +8283,21 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
-            tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
-                texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
-            );
+            let [texture_us, slots, skipped] = [0, 1, 2].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            if skipped > 0 {
+                tracing::info!(
+                    "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its pass over textures picked by index; {:.0} buffer slots looked at ({:.0} unchanged skipped by record_fast)",
+                    texture_us as f64 / 1e3 / frames,
+                    slots as f64 / frames,
+                    skipped as f64 / frames
+                );
+            } else {
+                tracing::info!(
+                    "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                    texture_us as f64 / 1e3 / frames,
+                    slots as f64 / frames
+                );
+            }
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);

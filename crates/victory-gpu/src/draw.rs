@@ -493,10 +493,11 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
-/// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
-/// picked by index that runs inside it (`heap_textures`), and the buffer
-/// slots the pass over buffer views looked at; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Of [`HEAP_BUFFER_MICROS`], `[0]` is the microseconds of the pass over
+/// textures picked by index (`heap_textures`), `[1]` is the buffer slots the
+/// pass over buffer views looked at, and `[2]` is the unchanged slots skipped
+/// by `VICTORY_HEAP_RECORD_FAST=1`; since the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -599,7 +600,7 @@ fn heap_buffer_pass(
 ) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> =
+    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), Picked>>> =
         std::sync::Mutex::new(None);
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = kept.get_or_insert_with(Default::default);
@@ -608,19 +609,24 @@ fn heap_buffer_pass(
         picked.note_forgotten(forgotten.as_deref());
     }
     let ranges = heaps
-        .entry(std::ptr::from_ref(host) as usize)
+        .entry((std::ptr::from_ref(host) as usize, host.count()))
         .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
     let changed = host.buffer_changes();
     let record_fn = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
-    let slots = ranges.plan(
+    let fast = crate::heap_pass::record_fast();
+    let (slots, skipped) = ranges.plan_ex(
         changed,
         || host.buffer_slots(),
         record_fn,
         crate::descriptor::record_entry,
+        fast,
     );
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
     HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+    if skipped > 0 {
+        HEAP_PASS_PARTS[2].fetch_add(skipped, Ordering::Relaxed);
+    }
     static WIDE_HEAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let wide_heap = *WIDE_HEAP.get_or_init(|| std::env::var_os("VICTORY_WIDE_HEAP").is_none_or(|v| v != "0"));
     if wide_heap && slots.len() >= 128 {
@@ -671,8 +677,8 @@ fn heap_buffer_pass(
         let chunks = std::mem::take(&mut *chunks_out.lock().unwrap_or_else(|e| e.into_inner()));
         for part in chunks {
             for (index, item) in part {
-                ranges.forget(index);
                 let Some((rec, entry, resolved)) = item else {
+                    ranges.forget(index);
                     continue;
                 };
                 let Some((shadow, address, len, unordered)) = resolved else {
@@ -684,7 +690,11 @@ fn heap_buffer_pass(
                     HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
                 }
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
-                ranges.keep(index, key, &shadow, [address, address + len], rec, entry, unordered);
+                if fast {
+                    ranges.keep_fast(index, key, &shadow, [address, address + len], rec, entry, unordered);
+                } else {
+                    ranges.keep(index, key, &shadow, [address, address + len], rec, entry, unordered);
+                }
             }
         }
         if alive && let Some(why) = crate::descriptor::host::device_removed() {
@@ -696,13 +706,14 @@ fn heap_buffer_pass(
         let _ = alive;
     } else {
         for (n, &index) in slots.iter().enumerate() {
-            ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
                 continue;
             };
             let rec = crate::descriptor::record_at(handle);
             let entry = crate::descriptor::record_entry(rec);
             let Some(view) = host.mirror_for_heap(index, handle) else {
+                ranges.forget(index);
                 continue;
             };
             if alive
@@ -729,7 +740,11 @@ fn heap_buffer_pass(
             }
             let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            ranges.keep(index, key, &shadow, [address, address + len], rec, entry, unordered);
+            if fast {
+                ranges.keep_fast(index, key, &shadow, [address, address + len], rec, entry, unordered);
+            } else {
+                ranges.keep(index, key, &shadow, [address, address + len], rec, entry, unordered);
+            }
         }
     }
     let views = ranges.views() as u32;
@@ -2161,30 +2176,56 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+        let fixed_span_ms = *SPAN_MS.get_or_init(|| {
             ["VICTORY_TEXTURE_STAGE_MS", "VICTORY_TEXTURE_QUEUE_MS"]
                 .iter()
                 .find_map(|k| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()))
                 .unwrap_or(1000)
-        }));
+        });
+        static ADAPTIVE: std::sync::OnceLock<(bool, u64, u64, usize)> = std::sync::OnceLock::new();
+        let &(adaptive_on, steady_ms, load_ms, threshold) = ADAPTIVE.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_TEXTURE_ADAPTIVE").is_some_and(|v| v == "1");
+            let steady = std::env::var("VICTORY_TEXTURE_ADAPTIVE_STEADY_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(8);
+            let load = std::env::var("VICTORY_TEXTURE_ADAPTIVE_LOAD_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(24);
+            let thresh = std::env::var("VICTORY_TEXTURE_ADAPTIVE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(2000);
+            (on, steady, load, thresh)
+        });
+        let span_ms = adaptive_texture_budget_ms(adaptive_on, fixed_span_ms, due.len(), steady_ms, load_ms, threshold);
         // A backlog (a scene's first minutes: 22,000 slots due) may get three times the
         // bytes and the time until it drains: `VICTORY_TEXTURE_CATCHUP=1` (off by default
         // here, the 1024 MB / 1000 ms budget being already above the fork's tripled one).
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_some_and(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span_ms) = if catchup && due.len() >= 1024 {
+            (per_frame * 3, span_ms.saturating_mul(3))
+        } else {
+            (per_frame, span_ms)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
-            None => (span, per_frame),
+        let (span_ms, bytes_at_most) = match PASS_BUDGET.get() {
+            Some((ms, bytes)) => (ms, SPENT.load(Ordering::Relaxed).saturating_add(bytes)),
+            None => (span_ms, per_frame),
         };
         let began = std::time::Instant::now();
         for (at, (index, write)) in due.into_iter().enumerate() {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if texture_pass_budget_hit(
+                at,
+                SPENT.load(Ordering::Relaxed),
+                bytes_at_most,
+                began.elapsed().as_millis() as u64,
+                span_ms,
+            ) {
                 break;
             }
             let bake_source = at < firsts;
@@ -4005,5 +4046,73 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Adaptive texture staging budget (`VICTORY_TEXTURE_ADAPTIVE=1`, default off):
+/// returns `load_ms` when `due_count > threshold` (loading/heavy streaming),
+/// `steady_ms` in normal gameplay, or `fixed_ms` when disabled.
+#[inline]
+fn adaptive_texture_budget_ms(
+    enabled: bool,
+    fixed_ms: u64,
+    due_count: usize,
+    steady_ms: u64,
+    load_ms: u64,
+    threshold: usize,
+) -> u64 {
+    if !enabled {
+        return fixed_ms;
+    }
+    if due_count > threshold { load_ms.max(1) } else { steady_ms.max(1) }
+}
+
+/// Pure anti-starvation check for `heap_textures`: always process at least 1
+/// texture per pass (`at > 0` before applying elapsed time cap) so a queue of
+/// `N` textures drains in at most `N` frames regardless of budget.
+#[inline]
+fn texture_pass_budget_hit(at: usize, spent: u64, bytes_at_most: u64, elapsed_ms: u64, budget_ms: u64) -> bool {
+    spent >= bytes_at_most || (at > 0 && elapsed_ms > budget_ms)
+}
+
+#[cfg(test)]
+mod adaptive_texture_tests {
+    use super::{adaptive_texture_budget_ms, texture_pass_budget_hit};
+
+    #[test]
+    fn adaptive_texture_budget_scales_between_load_and_steady_and_preserves_fixed_when_off() {
+        assert_eq!(adaptive_texture_budget_ms(false, 24, 50, 8, 24, 2000), 24);
+        assert_eq!(
+            adaptive_texture_budget_ms(true, 24, 2500, 8, 24, 2000),
+            24,
+            "backlog > 2000 must use load_ms=24"
+        );
+        assert_eq!(
+            adaptive_texture_budget_ms(true, 24, 500, 8, 24, 2000),
+            8,
+            "steady backlog <= 2000 must use steady_ms=8"
+        );
+    }
+
+    #[test]
+    fn adaptive_texture_queue_converges_without_starvation() {
+        let mut remaining = 50usize;
+        let mut frames = 0usize;
+        while remaining > 0 && frames < 100 {
+            frames += 1;
+            let budget = adaptive_texture_budget_ms(true, 24, remaining, 6, 24, 2000);
+            let mut processed = 0usize;
+            for at in 0..remaining {
+                // Simulate a slow 10ms texture exceeding steady budget=6ms: at==0 must still make progress.
+                let elapsed = (at as u64 + 1) * 10;
+                if texture_pass_budget_hit(at, 0, u64::MAX, elapsed, budget) {
+                    break;
+                }
+                processed += 1;
+            }
+            assert!(processed >= 1, "frame {frames} starved with remaining={remaining}");
+            remaining -= processed;
+        }
+        assert_eq!(remaining, 0, "texture queue must drain completely in bounded frames");
     }
 }

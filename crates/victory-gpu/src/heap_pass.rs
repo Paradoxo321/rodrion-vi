@@ -63,6 +63,15 @@ pub(crate) fn full_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_FULL").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_HEAP_RECORD_FAST=1` (default off): in `Picked::plan_ex`, skip slots
+/// in `changed` whose 12-byte descriptor record `[tag, i, gen]` is identical to
+/// the kept slot's record and whose view-table entry was not forgotten, plus
+/// batch `apply_batch` updates without redundant `forget`+`keep` churn.
+pub(crate) fn record_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECORD_FAST").is_some_and(|v| v == "1"))
+}
+
 /// A slot's record in title memory: the tag and two words
 /// (`descriptor::record_at`).
 pub(crate) type Record = [u32; 3];
@@ -158,25 +167,62 @@ impl<C: Clone> Picked<C> {
         record: impl Fn(u32) -> Option<Record>,
         entry: impl Fn(Record) -> Option<u32>,
     ) -> Vec<u32> {
+        self.plan_ex(changed, all, record, entry, false).0
+    }
+
+    /// Extended planner returning `(due_slots, skipped_unchanged_count)`.
+    /// When `skip_unchanged` is true (`VICTORY_HEAP_RECORD_FAST=1`), slots in
+    /// `changed` whose 12-byte descriptor record `[tag, i, gen]` matches the
+    /// kept slot's record (and whose view-table entry was not forgotten) are
+    /// skipped without re-resolving or churning `Picked`.
+    pub(crate) fn plan_ex(
+        &mut self,
+        changed: Vec<u32>,
+        all: impl FnOnce() -> Vec<u32>,
+        record: impl Fn(u32) -> Option<Record>,
+        entry: impl Fn(Record) -> Option<u32>,
+        skip_unchanged: bool,
+    ) -> (Vec<u32>, u64) {
         let pass = self.passes;
         self.passes += 1;
         let forgotten = self.forgotten.replace(Vec::new());
         if self.full {
             if pass.is_multiple_of(ORPHANS_EVERY) {
                 self.clear();
-                return all();
+                return (all(), 0);
             }
-            return changed;
+            return (changed, 0);
         }
         let Some(forgotten) = forgotten else {
             self.clear();
-            return all();
+            return (all(), 0);
         };
         if pass.is_multiple_of(FULL_EVERY) {
             self.clear();
-            return all();
+            return (all(), 0);
         }
-        let mut due: FastSet<u32> = changed.into_iter().collect();
+        let forgotten_set: FastSet<u32> = if skip_unchanged && !forgotten.is_empty() {
+            forgotten.iter().copied().collect()
+        } else {
+            FastSet::default()
+        };
+        let mut skipped = 0u64;
+        let mut due: FastSet<u32> = FastSet::default();
+        if skip_unchanged {
+            for slot in changed {
+                if let Some(kept) = self.slots.get(&slot)
+                    && kept.record[0] != 0
+                    && record(slot) == Some(kept.record)
+                    && !entry(kept.record).is_some_and(|e| forgotten_set.contains(&e))
+                {
+                    skipped += 1;
+                    continue;
+                }
+                due.insert(slot);
+            }
+        } else {
+            due.extend(changed);
+        }
         for e in forgotten {
             if let Some(slots) = self.by_entry.remove(&e) {
                 // Only those whose record still names the entry.
@@ -202,7 +248,7 @@ impl<C: Clone> Picked<C> {
         }
         let mut due: Vec<u32> = due.into_iter().collect();
         due.sort_unstable();
-        due
+        (due, skipped)
     }
 
     fn record_of(&self, slot: u32) -> Option<Record> {
@@ -262,6 +308,35 @@ impl<C: Clone> Picked<C> {
         c.slots.insert(slot);
         c.from = c.from.min(from);
         c.to = c.to.max(to);
+    }
+
+    /// Updates slot `slot` without redundant `forget`+`keep` churn when its
+    /// `(copy, from, to)` is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn keep_fast(
+        &mut self,
+        slot: u32,
+        key: usize,
+        copy: &C,
+        [from, to]: [u64; 2],
+        record: Record,
+        entry: Option<u32>,
+        unordered: bool,
+    ) {
+        if let Some(existing) = self.slots.get_mut(&slot)
+            && existing.copy == key
+            && existing.from == from
+            && existing.to == to
+        {
+            let old_record = existing.record;
+            existing.record = record;
+            existing.unordered = unordered;
+            if old_record != record {
+                self.note_entry(slot, entry);
+            }
+            return;
+        }
+        self.keep(slot, key, copy, [from, to], record, entry, unordered);
     }
 
     /// Slot `slot` holds a buffer view whose memory has no host copy yet.
@@ -473,6 +548,44 @@ mod tests {
             let want: Vec<u32> = if n.is_multiple_of(ORPHANS_EVERY) { vec![0, 1, 2, 3] } else { vec![2] };
             assert_eq!(due, want, "pass {n}");
         }
+    }
+
+    #[test]
+    fn record_fast_skips_unchanged_slots_in_changed_but_rechecks_modified_or_forgotten() {
+        let mut heap = heap(16);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        // Slot 2 unchanged, slot 5 modified, slot 7's table entry (107) forgotten.
+        heap.records.insert(5, [1, 555, 2]);
+        p.note_forgotten(Some(&[107]));
+        let (due, skipped) = p.plan_ex(
+            vec![2, 5, 7],
+            || (0..16).collect(),
+            |s| heap.record(s),
+            entry,
+            true,
+        );
+        assert_eq!(
+            due,
+            vec![5, 7],
+            "unchanged slot 2 must be skipped by record_fast while modified slot 5 and forgotten slot 7 stay due"
+        );
+        assert_eq!(skipped, 1, "exactly 1 unchanged slot must be counted as skipped");
+    }
+
+    #[test]
+    fn record_fast_keep_in_place_avoids_stale_when_bounds_unchanged_and_updates_when_changed() {
+        let heap = heap(8);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        // Update slot 0 with identical copy/bounds [0, 16] via keep_fast -> no stale span.
+        p.keep_fast(0, 0, &0, [0, 16], [1, 100, 2], Some(100), true);
+        assert_eq!(p.view(0), Some((&0, 0, 16, true)));
+        // Update slot 0 to new bounds [0, 32] -> copy 0 span grows from 64 to 64 (still covers [0, 32]).
+        p.keep_fast(0, 0, &0, [0, 128], [1, 100, 3], Some(100), false);
+        assert_eq!(p.view(0), Some((&0, 0, 128, false)));
+        let span0 = p.spans().into_iter().find(|s| s.0 == 0).unwrap();
+        assert_eq!((span0.1, span0.2), (0, 128));
     }
 }
 
