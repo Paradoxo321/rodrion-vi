@@ -83,6 +83,9 @@ pub(crate) struct TileSlot {
     /// Persistent CPU Write-Back pointer to the 64 KiB tile (`L0` RAM).
     pub(crate) ptr: *mut u8,
     pub(crate) page: PhysPage,
+    /// Lock-free per-tile sync generation cell (`HeapChunk::synced[tile]`,
+    /// immutable address for the lifetime of the chunk).
+    synced: *const TileSyncCell,
 }
 
 // SAFETY: `ptr` points to persistently mapped `L0` heap memory kept alive for
@@ -97,6 +100,8 @@ struct HeapChunk {
     /// Write-Back mapping (`ptr`) to every tile in `heap`.
     _cpu_buf: ID3D12Resource,
     cpu_ptr: *mut u8,
+    /// Per-tile lock-free sync generation cells (`VICTORY_TILED_LOCK_BATCH=1`).
+    synced: Box<[TileSyncCell]>,
     next_fresh: u32,
     free: Vec<u32>,
 }
@@ -208,10 +213,12 @@ impl TiledPool {
         }
         let id = self.chunks.len() as u32;
         crate::host::name(&cpu_buf, || format!("tiled pool L0 chunk #{id} (64 MiB)"));
+        let synced: Box<[TileSyncCell]> = (0..CHUNK_TILES).map(|_| TileSyncCell::new()).collect();
         self.chunks.push(HeapChunk {
             heap,
             _cpu_buf: cpu_buf,
             cpu_ptr: ptr.cast(),
+            synced,
             next_fresh: 0,
             free: Vec::new(),
         });
@@ -247,7 +254,10 @@ impl TiledPool {
                 (id, t)
             }
         };
-        let ptr = unsafe { self.chunks[chunk_id as usize].cpu_ptr.add(tile as usize * K64) };
+        let chunk_ref = &self.chunks[chunk_id as usize];
+        let ptr = unsafe { chunk_ref.cpu_ptr.add(tile as usize * K64) };
+        let synced_cell = &chunk_ref.synced[tile as usize];
+        synced_cell.reset();
         // Zero newly assigned tile so initial partial copies never expose stale bytes.
         unsafe { std::ptr::write_bytes(ptr, 0, K64) };
         let slot = TileSlot {
@@ -255,6 +265,7 @@ impl TiledPool {
             tile,
             ptr,
             page,
+            synced: synced_cell as *const TileSyncCell,
         };
         self.pages.insert(
             page,
@@ -501,6 +512,7 @@ impl TiledBacking {
         to: usize,
         watch_now: Option<u64>,
     ) -> usize {
+        let lock_free = lock_batch_on();
         let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let mut copied_bytes = 0usize;
         let mut at = from;
@@ -510,19 +522,33 @@ impl TiledBacking {
             let n = (K64 - in_tile).min(to - at);
             if let Some(slot) = slots.get(idx).copied().flatten() {
                 let whole_page = in_tile == 0 && n == K64;
-                if whole_page
-                    && let Some(now) = watch_now
-                    && is_page_synced(slot.page, now)
-                {
-                    note_dedup_skip();
-                    at += n;
-                    continue;
+                if whole_page && let Some(now) = watch_now {
+                    let already = if lock_free {
+                        TILED_FAST_SYNC[0].fetch_add(1, Ordering::Relaxed);
+                        // SAFETY: `slot.synced` points into `HeapChunk::synced` which lives for process lifetime.
+                        unsafe { &*slot.synced }.is_synced(now, true)
+                    } else {
+                        is_page_synced(slot.page, now)
+                    };
+                    if already {
+                        if lock_free {
+                            TILED_FAST_SYNC[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        note_dedup_skip();
+                        at += n;
+                        continue;
+                    }
                 }
                 let dst = unsafe { slot.ptr.add(in_tile) };
                 crate::host::copy_mapped(dst, at as *const u8, n, false);
                 copied_bytes += n;
                 if whole_page && let Some(now) = watch_now {
-                    mark_page_synced(slot.page, now);
+                    if lock_free {
+                        // SAFETY: `slot.synced` points into `HeapChunk::synced` which lives for process lifetime.
+                        unsafe { &*slot.synced }.mark_synced(now, true);
+                    } else {
+                        mark_page_synced(slot.page, now);
+                    }
                 }
             }
             at += n;
@@ -926,6 +952,53 @@ pub(crate) fn create(
     Some((buffer, gpu, backing))
 }
 
+/// `VICTORY_TILED_LOCK_BATCH=1` (default off): per-tile lock-free `AtomicU64`
+/// `synced_watch` check/update in `TiledBacking::copy_from_title`, eliminating
+/// 2× global `POOL` mutex locks + HashMap lookups per 64 KiB page.
+pub(crate) fn lock_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TILED_LOCK_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// `[0]` lock-free sync checks, `[1]` lock-free dedup skips.
+pub(crate) static TILED_FAST_SYNC: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Lock-free per-tile sync generation cell.
+pub(crate) struct TileSyncCell(AtomicU64);
+
+impl TileSyncCell {
+    pub(crate) fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    #[inline]
+    pub(crate) fn is_synced(&self, now: u64, fast: bool) -> bool {
+        fast && now != 0 && self.0.load(Ordering::Acquire) >= now
+    }
+
+    #[inline]
+    pub(crate) fn mark_synced(&self, now: u64, fast: bool) {
+        if fast && now != 0 {
+            self.0.fetch_max(now, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn reset(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) fn fast_sync_line(frames: f64) {
+    let checks = TILED_FAST_SYNC[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let skips = TILED_FAST_SYNC[1].swap(0, Ordering::Relaxed) as f64 / frames;
+    if checks > 0.0 {
+        tracing::info!(
+            "tiled lock-free sync per frame (VICTORY_TILED_LOCK_BATCH=1): {checks:.0} lock-free checks ({skips:.0} deduped, 0 POOL locks)"
+        );
+    }
+}
+
 /// Telemetry line printed alongside `inplace::say()` every 10 seconds.
 pub(crate) fn say() {
     if !enabled() {
@@ -959,4 +1032,20 @@ pub(crate) fn say() {
          {utm} UpdateTileMappings ({avg_us:.0} us avg); {refused} skipped",
         (unique_pages * K64) >> 20,
     );
+}
+
+#[cfg(test)]
+mod tile_sync_tests {
+    use super::TileSyncCell;
+
+    #[test]
+    fn lock_free_tile_sync_dedups_same_gen_and_refreshes_on_newer_gen() {
+        let cell = TileSyncCell::new();
+        assert!(!cell.is_synced(7, true));
+        cell.mark_synced(7, true);
+        assert!(cell.is_synced(7, true), "same generation must dedup-skip");
+        assert!(!cell.is_synced(8, true), "newer generation must NOT skip stale tile");
+        cell.reset();
+        assert!(!cell.is_synced(7, true), "reused tile after reset must NOT skip");
+    }
 }

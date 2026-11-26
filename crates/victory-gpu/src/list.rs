@@ -890,7 +890,60 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// `VICTORY_COPY_ON_GPU=1` (default off): route `CopyBufferRegion` from a
+/// GPU-written shadowed source into an unshadowed CPU readback target onto the
+/// GPU command list + `defer_read_back`, eliminating the `WHY_READ` CPU settle.
+#[cfg(windows)]
+pub(crate) fn copy_on_gpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_ON_GPU").is_some_and(|v| v == "1"))
+}
+
+/// `[0]` GPU readback copies recorded, `[1]` bytes copied on GPU, `[2]` skipped because dst had shadow.
+#[cfg(windows)]
+pub(crate) static COPY_ON_GPU_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuCopyRoute {
+    Cpu,
+    GpuReadback,
+    GpuShadowToShadow,
+}
+
+/// Pure routing decision for `VICTORY_COPY_ON_GPU=1`.
+fn choose_gpu_copy_route(
+    enabled: bool,
+    len: u64,
+    src_range_pending: bool,
+    dst_has_shadow: bool,
+    same_shadow: bool,
+) -> GpuCopyRoute {
+    if !enabled || len == 0 || len > (4 << 20) || !src_range_pending {
+        return GpuCopyRoute::Cpu;
+    }
+    if !dst_has_shadow {
+        GpuCopyRoute::GpuReadback
+    } else if !same_shadow {
+        GpuCopyRoute::GpuShadowToShadow
+    } else {
+        GpuCopyRoute::Cpu
+    }
+}
+
+/// Pure routing decision for `VICTORY_COPY_ON_GPU=1`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn should_gpu_readback_copy(
+    enabled: bool,
+    len: u64,
+    src_gpu_written: bool,
+    dst_has_shadow: bool,
+) -> bool {
+    enabled && len > 0 && len <= (4 << 20) && src_gpu_written && !dst_has_shadow
+}
+
+/// Buffer to buffer: both are host memory, copied at submission (or on GPU when
+/// `VICTORY_COPY_ON_GPU=1` avoids a `WHY_READ` settle on in-flight GPU writes).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -904,6 +957,69 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if copy_on_gpu() && len > 0 && len <= (4 << 20) {
+            if let Some(src_shadow) = crate::shadow::find(from as u64, len) {
+                let pending = src_shadow.range_writes_pending(from as usize, len as usize);
+                if pending {
+                    let dst_shadow = crate::shadow::find(to as u64, len);
+                    let same = dst_shadow
+                        .as_ref()
+                        .is_some_and(|d| std::sync::Arc::ptr_eq(&src_shadow, d));
+                    match choose_gpu_copy_route(true, len, true, dst_shadow.is_some(), same) {
+                        GpuCopyRoute::GpuShadowToShadow => {
+                            if let Some(dst_shadow) = dst_shadow {
+                                src_shadow.refresh(list, from as u64, len);
+                                dst_shadow.refresh(list, to as u64, len);
+                                list.begin_command();
+                                list.buffer_state(&src_shadow.buffer, crate::host::BUFFER_READ);
+                                list.buffer_state(&dst_shadow.buffer, COPY_DEST);
+                                list.keep(&src_shadow.buffer);
+                                list.keep(&dst_shadow.buffer);
+                                // SAFETY: open command list; distinct buffers in COPY_SOURCE (via BUFFER_READ) and COPY_DEST.
+                                unsafe {
+                                    list.list.CopyBufferRegion(
+                                        &dst_shadow.buffer,
+                                        dst_shadow.offset(to as u64),
+                                        &src_shadow.buffer,
+                                        src_shadow.offset(from as u64),
+                                        len,
+                                    );
+                                }
+                                dst_shadow.gpu_writes(list, to as u64, len);
+                                COPY_ON_GPU_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                COPY_ON_GPU_STATS[1].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                        GpuCopyRoute::GpuReadback => {
+                            if let Some(rb) = crate::host::host().and_then(|h| h.read_back_buffer(len)) {
+                                src_shadow.refresh(list, from as u64, len);
+                                list.begin_command();
+                                list.buffer_state(&src_shadow.buffer, crate::host::BUFFER_READ);
+                                list.keep(&src_shadow.buffer);
+                                // SAFETY: open command list; `rb` is READBACK (COPY_DEST), `src_shadow.buffer` is BUFFER_READ.
+                                unsafe {
+                                    list.list.CopyBufferRegion(
+                                        &rb,
+                                        0,
+                                        &src_shadow.buffer,
+                                        src_shadow.offset(from as u64),
+                                        len,
+                                    );
+                                }
+                                list.defer_read_back(rb, to, [len as usize, 1, len as usize]);
+                                COPY_ON_GPU_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                COPY_ON_GPU_STATS[1].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        }
+                        GpuCopyRoute::Cpu => {
+                            COPY_ON_GPU_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -2328,5 +2444,38 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn copy_on_gpu_routes_only_gpu_written_src_to_unshadowed_dst() {
+        assert!(
+            super::should_gpu_readback_copy(true, 20480, true, false),
+            "GPU-written src to unshadowed readback dst must route on GPU"
+        );
+        assert!(!super::should_gpu_readback_copy(false, 20480, true, false));
+        assert!(!super::should_gpu_readback_copy(true, 20480, false, false));
+        assert!(!super::should_gpu_readback_copy(true, 20480, true, true));
+        assert!(!super::should_gpu_readback_copy(true, 0, true, false));
+        assert!(!super::should_gpu_readback_copy(true, 8 << 20, true, false));
+    }
+
+    #[test]
+    fn copy_on_gpu_routes_shadow_to_shadow_when_distinct_and_pending() {
+        use super::{GpuCopyRoute, choose_gpu_copy_route};
+        assert_eq!(
+            choose_gpu_copy_route(true, 20480, true, true, false),
+            GpuCopyRoute::GpuShadowToShadow,
+            "pending GPU-written src to distinct shadowed dst must route GPU-to-GPU"
+        );
+        assert_eq!(
+            choose_gpu_copy_route(true, 20480, true, true, true),
+            GpuCopyRoute::Cpu,
+            "same shadow buffer must stay CPU to avoid COPY_SOURCE/COPY_DEST hazard"
+        );
+        assert_eq!(
+            choose_gpu_copy_route(true, 20480, false, true, false),
+            GpuCopyRoute::Cpu,
+            "non-pending src range must stay CPU"
+        );
     }
 }

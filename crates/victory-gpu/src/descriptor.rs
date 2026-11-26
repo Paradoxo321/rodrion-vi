@@ -183,8 +183,11 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut take_us, mut scan_us, mut mirror_us) = (0u64, 0u64, 0u64);
+    let (mut pages_skipped, mut bytes_saved, mut wide_calls) = (0u64, 0u64, 0u64);
     let mut parts: Vec<(usize, usize)> = Vec::new();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let skip_tabled_pages = host::sync_skip_tabled_pages();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -198,6 +201,7 @@ pub(crate) fn sync_heaps() {
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
         parts.clear();
+        let take_t = std::time::Instant::now();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -205,19 +209,53 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        take_us += take_t.elapsed().as_micros() as u64;
         if parts.is_empty() {
             continue;
         }
         let frame = crate::frame::current();
         let check_tabled = host::HostHeap::sync_check_tabled();
-        let scan_chunk = move |host: &host::HostHeap, slice: &[(usize, usize)]| -> (u64, u64, u64, Vec<(u32, u64)>) {
+        let scan_t = std::time::Instant::now();
+        let scan_chunk = move |host: &host::HostHeap,
+                               slice: &[(usize, usize)]|
+              -> (u64, u64, u64, u64, u64, u64, Vec<(u32, u64)>) {
             let mut p_cnt = 0u64;
             let mut l_cnt = 0u64;
             let mut t_skip = 0u64;
+            let mut m_inline = 0u64;
+            let mut p_skip = 0u64;
+            let mut b_saved = 0u64;
             let mut page_bytes: Vec<u8> = Vec::with_capacity(crate::watch::PAGE);
             let mut batch: Vec<(u32, u64)> = Vec::new();
             for &(from, to) in slice {
-                let len = to - from;
+                let full_len = to - from;
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                let (copy_from, copy_to, iter_slots) = if skip_tabled_pages {
+                    let (sub, skipped) = host.untabled_subrange(
+                        slots.start as u32,
+                        slots.end as u32,
+                        frame,
+                        check_tabled,
+                    );
+                    t_skip += skipped;
+                    let Some((u_first, u_last)) = sub else {
+                        p_skip += 1;
+                        b_saved += full_len as u64;
+                        continue;
+                    };
+                    let cf = (start as usize + (u_first as usize) * (step as usize)).max(from);
+                    let ct = (start as usize + (u_last as usize) * (step as usize)).min(to);
+                    if ct <= cf {
+                        p_skip += 1;
+                        b_saved += full_len as u64;
+                        continue;
+                    }
+                    b_saved += full_len.saturating_sub(ct - cf) as u64;
+                    (cf, ct, u64::from(u_first)..u64::from(u_last))
+                } else {
+                    (from, to, slots)
+                };
+                let len = copy_to - copy_from;
                 if page_bytes.capacity() < len {
                     page_bytes.reserve(len - page_bytes.len());
                 }
@@ -227,14 +265,13 @@ pub(crate) fn sync_heaps() {
                 unsafe {
                     page_bytes.set_len(len);
                 }
-                let ok = crate::plaincopy::copy(page_bytes.as_mut_ptr(), from as *const u8, len)
-                    || crate::host::read_into(from as *const u8, &mut page_bytes);
+                let ok = crate::plaincopy::copy(page_bytes.as_mut_ptr(), copy_from as *const u8, len)
+                    || crate::host::read_into(copy_from as *const u8, &mut page_bytes);
                 if ok {
                     p_cnt += 1;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    for index in slots {
+                    for index in iter_slots {
                         let handle = start + index * step;
-                        let Some(at) = (handle as usize).checked_sub(from) else {
+                        let Some(at) = (handle as usize).checked_sub(copy_from) else {
                             continue;
                         };
                         let Some(record) = page_bytes.get(at..at + step as usize) else {
@@ -249,21 +286,30 @@ pub(crate) fn sync_heaps() {
                             if tag != VIEW_TAG && host.is_empty_slot(index as u32) {
                                 continue;
                             }
-                            batch.push((index as u32, handle));
+                            if skip_tabled_pages {
+                                // Fused scan+mirror in one pass (avoids second wide_run barrier & Vec alloc).
+                                host.mirror(index as u32, handle, false);
+                                m_inline += 1;
+                            } else {
+                                batch.push((index as u32, handle));
+                            }
                         }
                     }
                 }
             }
-            (p_cnt, l_cnt, t_skip, batch)
+            (p_cnt, l_cnt, t_skip, m_inline, p_skip, b_saved, batch)
         };
-        let dirty_batch: Vec<(u32, u64)> = if wide_sync() && parts.len() >= 4 {
+        let wide_min = if skip_tabled_pages { 16 } else { 4 };
+        let dirty_batch: Vec<(u32, u64)> = if wide_sync() && parts.len() >= wide_min {
+            wide_calls += 1;
             // Reuse persistent `wide_run` thread pool instead of spawning fresh
             // OS threads 40-80x/frame via `std::thread::scope`.
             let threads = crate::shadow::wide_threads().clamp(2, 8);
             let chunk = parts.len().div_ceil(threads).max(4);
             let host_ptr = host as *const host::HostHeap as usize;
-            let results: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, u64, Vec<(u32, u64)>)>>> =
-                std::sync::Arc::default();
+            let results: std::sync::Arc<
+                std::sync::Mutex<Vec<(u64, u64, u64, u64, u64, u64, Vec<(u32, u64)>)>>,
+            > = std::sync::Arc::default();
             let jobs: Vec<Box<dyn FnOnce() + Send>> = parts
                 .chunks(chunk)
                 .map(|slice| {
@@ -282,10 +328,13 @@ pub(crate) fn sync_heaps() {
             let results = std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner()));
             let mut all = Vec::new();
             let mut tabled_total = 0u64;
-            for (p, l, t, b) in results {
+            for (p, l, t, m_in, ps, bs, b) in results {
                 pages += p;
                 looked += l;
                 tabled_total += t;
+                mirrored += m_in;
+                pages_skipped += ps;
+                bytes_saved += bs;
                 all.extend(b);
             }
             if tabled_total > 0 {
@@ -293,17 +342,23 @@ pub(crate) fn sync_heaps() {
             }
             all
         } else {
-            let (p, l, t, b) = scan_chunk(host, &parts);
+            let (p, l, t, m_in, ps, bs, b) = scan_chunk(host, &parts);
             pages += p;
             looked += l;
+            mirrored += m_in;
+            pages_skipped += ps;
+            bytes_saved += bs;
             if t > 0 {
                 host::COPIED_TABLED.fetch_add(t, Relaxed);
             }
             b
         };
+        scan_us += scan_t.elapsed().as_micros() as u64;
         if !dirty_batch.is_empty() {
+            let mirror_t = std::time::Instant::now();
             mirrored += dirty_batch.len() as u64;
             if wide_sync() && dirty_batch.len() >= 32 {
+                wide_calls += 1;
                 let threads = crate::shadow::wide_threads().clamp(2, 8);
                 let chunk = dirty_batch.len().div_ceil(threads).max(32);
                 let host_ptr = host as *const host::HostHeap as usize;
@@ -326,13 +381,22 @@ pub(crate) fn sync_heaps() {
                     host.mirror(index, handle, false);
                 }
             }
+            mirror_us += mirror_t.elapsed().as_micros() as u64;
         }
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+    for (count, n) in SYNC_BREAKDOWN.iter().zip([take_us, scan_us, mirror_us, pages_skipped, bytes_saved, wide_calls]) {
+        count.fetch_add(n, Relaxed);
+    }
 }
+
+/// Breakdown of [`sync_heaps`]: `[take_us, scan_us, mirror_us, pages_skipped_tabled, bytes_copy_saved, wide_calls]`.
+#[cfg(windows)]
+pub(crate) static SYNC_BREAKDOWN: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -344,8 +408,11 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    if pages == 0 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, Relaxed));
+    let [take_us, scan_us, mirror_us, p_skip, b_saved, wide] =
+        [0, 1, 2, 3, 4, 5].map(|i| SYNC_BREAKDOWN[i].swap(0, Relaxed));
+    if pages == 0 && p_skip == 0 {
         return;
     }
     tracing::info!(
@@ -354,8 +421,18 @@ pub(crate) fn sync_line(frames: f64) {
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
-        host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+        host::COPIED_TABLED.swap(0, Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
+    );
+    tracing::info!(
+        "sync_heaps breakdown (VICTORY_SYNC_SKIP_TABLED_PAGES={}): take {:.2} ms, scan {:.2} ms, mirror {:.2} ms, {:.1} pages skipped ({:.2} MB copy saved), {:.1} wide_run calls/frame",
+        u8::from(host::sync_skip_tabled_pages()),
+        take_us as f64 / 1000.0 / frames,
+        scan_us as f64 / 1000.0 / frames,
+        mirror_us as f64 / 1000.0 / frames,
+        p_skip as f64 / frames,
+        b_saved as f64 / (1024.0 * 1024.0) / frames,
+        wide as f64 / frames,
     );
 }
 

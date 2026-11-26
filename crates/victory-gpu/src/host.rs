@@ -2794,6 +2794,20 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            static LOGGED: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                                let src_hit = touches(written, src, src + len);
+                                let dst_hit = touches(written, dst, dst + len);
+                                tracing::info!(
+                                    src = format_args!("{src:#x}"),
+                                    dst = format_args!("{dst:#x}"),
+                                    len,
+                                    src_hit,
+                                    dst_hit,
+                                    "WHY_READ settle triggered by Step::Copy"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -3424,8 +3438,13 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
-                for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                if *rows == 1 {
+                    crate::watch::writing(*at, *row);
+                    write_mapped(*at as *mut u8, from, *row);
+                } else {
+                    for line in 0..*rows {
+                        std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    }
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -4841,6 +4860,21 @@ impl Host {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            // Linear buffer read-backs (e.g. VICTORY_COPY_ON_GPU=1) land in title memory
+            // when this flight settles: track them in `written` so any later GPU read waits.
+            join_ranges(
+                written,
+                order.iter().flat_map(|&i| {
+                    lists[i]
+                        .host()
+                        .deferred()
+                        .backs
+                        .iter()
+                        .filter(|(_, _, [_, rows, _])| *rows == 1)
+                        .map(|(_, at, [row, _, _])| (*at, at.saturating_add(*row)))
+                        .collect::<Vec<_>>()
+                }),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6588,10 +6622,18 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    BATCH_RANGE_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    let range_ok = batch_range_flush() && !has_multi_view_alias(dst, len);
+                    if range_ok {
+                        batch.title_written_range(dst, len);
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        crate::watch::wrote_keep_stamp(dst, len);
+                    } else {
+                        batch.title_written();
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        // With the submission's one asking: the journal learns it.
+                        crate::watch::wrote(dst, len);
+                    }
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -6647,7 +6689,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due_staging(staging) {
                         if crate::texture::batched() {
                             textures.push(staging.clone());
                         } else {
@@ -6681,6 +6723,96 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_BATCH_RANGE_FLUSH=1` (default off): on `Step::Copy(dst, src, len)`,
+/// flush only pending refreshes overlapping `[dst, dst+len)` (and aliases),
+/// evict only overlapping textures, and avoid global `stamp::advance()`.
+fn batch_range_flush() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_RANGE_FLUSH").is_some_and(|v| v == "1"))
+}
+
+/// `[0]` `Step::Copy` steps, `[1]` refreshes kept coalesced, `[2]` refreshes flushed on overlap,
+/// `[3]` cached textures kept across `Step::Copy`.
+static BATCH_RANGE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Pure range-tracking logic tested deterministically alongside [`Batch`].
+#[cfg(test)]
+#[derive(Default)]
+struct RangeBatchState {
+    refreshes: Vec<(usize, usize, usize)>,
+    textures: std::collections::HashMap<usize, (usize, usize)>,
+    written_ranges: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+impl RangeBatchState {
+    fn add_refresh(&mut self, key: usize, from: usize, to: usize) {
+        if let Some(r) = self.refreshes.iter_mut().find(|r| r.0 == key) {
+            r.1 = r.1.min(from);
+            r.2 = r.2.max(to);
+        } else {
+            self.refreshes.push((key, from, to));
+        }
+    }
+
+    fn note_texture(&mut self, key: usize, from: usize, to: usize) -> bool {
+        let is_new = !self.textures.contains_key(&key);
+        self.textures.insert(key, (from, to));
+        is_new
+    }
+
+    fn can_skip_current(&self, from: usize, to: usize) -> bool {
+        !self.written_ranges.iter().any(|&(a, b)| a < to && from < b)
+    }
+
+    fn on_title_write(&mut self, dst: usize, len: usize, range_scoped: bool) -> Vec<(usize, usize, usize)> {
+        if !range_scoped {
+            self.textures.clear();
+            return std::mem::take(&mut self.refreshes);
+        }
+        let end = dst.saturating_add(len);
+        if end <= dst {
+            return Vec::new();
+        }
+        let mut flushed = Vec::new();
+        let mut kept = Vec::with_capacity(self.refreshes.len());
+        for r in self.refreshes.drain(..) {
+            if r.1 < end && dst < r.2 {
+                flushed.push(r);
+            } else {
+                kept.push(r);
+            }
+        }
+        self.refreshes = kept;
+        self.textures.retain(|_, &mut (a, b)| !(a < end && dst < b));
+        join_ranges(&mut self.written_ranges, [(dst, end)]);
+        flushed
+    }
+}
+
+/// True if any 64 KiB page of `[dst, dst+len)` is mapped into more than one virtual view.
+fn has_multi_view_alias(dst: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = dst.saturating_add(len);
+    let views = crate::inplace::views_between(dst, end);
+    if views.is_empty() {
+        return false;
+    }
+    let page = crate::watch::PAGE;
+    for (v_start, v_len) in views {
+        let from = v_start.max(dst) / page;
+        let to = v_start.saturating_add(v_len).min(end).div_ceil(page);
+        for p in from..to {
+            if crate::inplace::pages_of(p * page).len() > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -6697,13 +6829,22 @@ struct Batch {
     /// for every refresh of a submission was tens of millions of
     /// comparisons a frame.
     index: std::collections::HashMap<usize, usize>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) refreshed since the last title write, with their
+    /// title-memory `[from, to)` span for range-scoped eviction.
+    textures: std::collections::HashMap<usize, (usize, usize)>,
+    /// Title-memory ranges written by `Step::Copy` in this submission when
+    /// `VICTORY_BATCH_RANGE_FLUSH=1` avoids advancing the global refresh stamp.
+    written_ranges: Vec<(usize, usize)>,
 }
 
 impl Batch {
+    fn overlaps_written(&self, from: usize, to: usize) -> bool {
+        touches(&self.written_ranges, from, to)
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        if shadow.current(address, len) {
+        let end = address + len;
+        if !self.overlaps_written(address, end) && shadow.current(address, len) {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::add(crate::copystat::C::Skipped, 1);
@@ -6711,7 +6852,6 @@ impl Batch {
             }
             return;
         }
-        let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
@@ -6752,8 +6892,17 @@ impl Batch {
 
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        self.textures.insert(key, (0, usize::MAX)).is_none()
+    }
+
+    /// Range-aware [`Batch::texture_due`] for `texture::Staging`.
+    fn texture_due_staging(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as usize;
+        let (at, len) = staging.memory();
+        self.textures.insert(key, (at, at.saturating_add(len))).is_none()
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -6761,6 +6910,40 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.written_ranges.clear();
+    }
+
+    /// Range-scoped [`Batch::title_written`] for `Step::Copy(dst, src, len)`
+    /// (`VICTORY_BATCH_RANGE_FLUSH=1`): flushes only pending refreshes overlapping
+    /// `[dst, dst+len)`, evicts only overlapping cached textures, and records the
+    /// written range so later `Batch::add` skips `current()` on it.
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        let end = dst.saturating_add(len);
+        if end <= dst {
+            return;
+        }
+        let mut overlapping = Vec::new();
+        let mut kept = Vec::with_capacity(self.refreshes.len());
+        for entry in self.refreshes.drain(..) {
+            if entry.1 < end && dst < entry.2 {
+                overlapping.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.refreshes = kept;
+        self.index.clear();
+        for (i, entry) in self.refreshes.iter().enumerate() {
+            self.index.insert(std::sync::Arc::as_ptr(&entry.0) as usize, i);
+        }
+        BATCH_RANGE_STATS[1].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+        BATCH_RANGE_STATS[2].fetch_add(overlapping.len() as u64, Ordering::Relaxed);
+        for (shadow, from, to) in overlapping {
+            Self::update(&shadow, from, to);
+        }
+        self.textures.retain(|_, &mut (a, b)| !(a < end && dst < b));
+        BATCH_RANGE_STATS[3].fetch_add(self.textures.len() as u64, Ordering::Relaxed);
+        join_ranges(&mut self.written_ranges, [(dst, end)]);
     }
 
     fn flush(&mut self) {
@@ -7545,6 +7728,30 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::watch::fast_stats_line(frames);
+        crate::tiled::fast_sync_line(frames);
+        {
+            let [sc, kept, flushed, tex_kept] =
+                [0, 1, 2, 3].map(|i| BATCH_RANGE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if sc > 0.0 {
+                tracing::info!(
+                    "batch Step::Copy per frame (VICTORY_BATCH_RANGE_FLUSH={}): {sc:.1} copies, {kept:.1} refreshes kept coalesced, {flushed:.1} flushed on overlap, {tex_kept:.1} textures kept cached",
+                    u8::from(batch_range_flush()),
+                );
+            }
+        }
+        {
+            let [gpu_copies, gpu_bytes, skipped_dst] = [0, 1, 2].map(|i| {
+                crate::list::COPY_ON_GPU_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
+            });
+            if gpu_copies + skipped_dst > 0.0 {
+                tracing::info!(
+                    "copy_buffer_region on GPU per frame (VICTORY_COPY_ON_GPU={}): {gpu_copies:.1} GPU readbacks ({:.1} KiB), {skipped_dst:.1} kept CPU (dst shadowed)",
+                    u8::from(crate::list::copy_on_gpu()),
+                    gpu_bytes / 1024.0,
+                );
+            }
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
@@ -8629,5 +8836,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn batch_range_flush_keeps_disjoint_refreshes_and_flushes_overlapping() {
+        let mut st = super::RangeBatchState::default();
+        st.add_refresh(1, 0x10000, 0x20000);
+        st.add_refresh(2, 0x40000, 0x50000);
+        assert!(st.note_texture(101, 0x10000, 0x20000));
+        assert!(st.note_texture(102, 0x48000, 0x4C000));
+
+        // Write overlapping R2 and T2, disjoint from R1 and T1.
+        let flushed = st.on_title_write(0x45000, 0x4000, true);
+        assert_eq!(flushed, vec![(2, 0x40000, 0x50000)], "only overlapping refresh must flush");
+        assert_eq!(st.refreshes, vec![(1, 0x10000, 0x20000)], "disjoint refresh must stay coalesced");
+        assert!(!st.note_texture(101, 0x10000, 0x20000), "disjoint texture must stay cached");
+        assert!(st.note_texture(102, 0x48000, 0x4C000), "overlapping texture must be invalidated");
+        assert!(!st.can_skip_current(0x45000, 0x46000), "written range must not skip current()");
+        assert!(st.can_skip_current(0x10000, 0x11000), "disjoint range may skip current()");
+
+        // Boundary non-overlap [0x0C000, 0x10000) touches R1=[0x10000, 0x20000) only at edge.
+        let flushed_edge = st.on_title_write(0x0C000, 0x4000, true);
+        assert!(flushed_edge.is_empty(), "half-open edge must not flush R1");
+        assert_eq!(st.refreshes.len(), 1);
     }
 }

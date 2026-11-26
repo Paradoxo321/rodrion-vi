@@ -88,6 +88,8 @@ pub(crate) struct Shadow {
     /// (Neptune / avatarmanz) Last 2 whole ranges `(from, to, asking)` copied,
     /// avoiding repeated re-copies of partial 64 KiB boundary pages (`VICTORY_RANGED=1`).
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// True once any GPU shader write has been declared on this shadow (`VICTORY_COPY_ON_GPU=1`).
+    gpu_written: std::sync::atomic::AtomicBool,
 }
 
 /// Staging backing for a VRAM `Card` copy: either a zero-copy
@@ -2702,6 +2704,7 @@ impl Shadow {
             place: None,
             tiled: None,
             ranged: Mutex::new([(0, 0, 0); 2]),
+            gpu_written: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2729,7 +2732,26 @@ impl Shadow {
         // `writing()`, `copy_back_with()`, `copy_back_done()`, and
         // `relay_hand_back()` all skip in-place shadows with zero CPU work.
         let len = len.min(self.left(address));
+        self.gpu_written.store(true, Ordering::Release);
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// True if any GPU shader write has been recorded on this shadow.
+    pub(crate) fn ever_gpu_written(&self) -> bool {
+        self.gpu_written.load(Ordering::Acquire)
+    }
+
+    /// True if an in-flight GPU shader write currently overlaps `[address, address + len)`.
+    pub(crate) fn range_writes_pending(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        if end <= address {
+            return false;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < end && address < e)
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

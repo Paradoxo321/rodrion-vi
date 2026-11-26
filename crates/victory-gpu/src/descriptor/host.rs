@@ -2121,6 +2121,67 @@ impl HostHeap {
     pub(crate) fn sync_check_tabled() -> bool {
         !sync_tables() && tabled_out()
     }
+}
+
+/// `VICTORY_SYNC_SKIP_TABLED_PAGES=1` (default off): skip copying 64 KiB heap pages
+/// whose slots are all `tabled_lately`, trim partial pages to their untabled span,
+/// and fuse scan+mirror in a single pass.
+pub(crate) fn sync_skip_tabled_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_SKIP_TABLED_PAGES").is_some_and(|v| v == "1"))
+}
+
+/// Finds the tight `[first_untabled, last_untabled_excl)` subrange within `[start, end)`
+/// and returns `(subrange, skipped_tabled_slots)`.
+pub(crate) fn untabled_subrange(
+    tabled: &[std::sync::atomic::AtomicU32],
+    start: u32,
+    end: u32,
+    frame: u64,
+    tabled_out: bool,
+    skip_enabled: bool,
+) -> (Option<(u32, u32)>, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if start >= end {
+        return (None, 0);
+    }
+    if !skip_enabled || !tabled_out {
+        return (Some((start, end)), 0);
+    }
+    let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+    let is_tabled = |idx: u32| -> bool {
+        let stamp = tabled
+            .get(idx as usize)
+            .map_or(0, |s| s.load(Relaxed))
+            & !TABLED_READ;
+        stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+    };
+    let mut first = start;
+    while first < end && is_tabled(first) {
+        first += 1;
+    }
+    if first == end {
+        return (None, u64::from(end - start));
+    }
+    let mut last = end;
+    while last > first + 1 && is_tabled(last - 1) {
+        last -= 1;
+    }
+    let skipped = u64::from((first - start) + (end - last));
+    (Some((first, last)), skipped)
+}
+
+impl HostHeap {
+    #[inline]
+    pub(crate) fn untabled_subrange(
+        &self,
+        start: u32,
+        end: u32,
+        frame: u64,
+        check_tabled: bool,
+    ) -> (Option<(u32, u32)>, u64) {
+        untabled_subrange(&self.tabled, start, end, frame, check_tabled, sync_skip_tabled_pages())
+    }
 
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if !self.check_copied(index, record) {
@@ -4086,5 +4147,38 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod tabled_page_skip_tests {
+    use std::sync::atomic::AtomicU32;
+    use super::{TABLED_FRAMES, TABLED_READ, untabled_subrange};
+
+    #[test]
+    fn untabled_subrange_skips_pure_tabled_page_and_keeps_expired_or_untabled() {
+        let frame = 500u64;
+        let fresh = ((frame as u32).wrapping_add(1) & !TABLED_READ) | TABLED_READ;
+        let slots: Vec<AtomicU32> = (0..2048).map(|_| AtomicU32::new(fresh)).collect();
+
+        // Pure tabled page: must return None and count all 2048 skipped slots.
+        assert_eq!(untabled_subrange(&slots, 0, 2048, frame, true, true), (None, 2048));
+
+        // Single untabled slot at 1000: must trim tightly to (1000, 1001).
+        slots[1000].store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            untabled_subrange(&slots, 0, 2048, frame, true, true),
+            (Some((1000, 1001)), 2047)
+        );
+
+        // Restore 1000, expire slot 500 beyond TABLED_FRAMES: must NOT be skipped!
+        slots[1000].store(fresh, std::sync::atomic::Ordering::Relaxed);
+        let expired_frame = frame - TABLED_FRAMES - 1;
+        let expired = (expired_frame as u32).wrapping_add(1) & !TABLED_READ;
+        slots[500].store(expired, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            untabled_subrange(&slots, 0, 2048, frame, true, true),
+            (Some((500, 501)), 2047)
+        );
     }
 }

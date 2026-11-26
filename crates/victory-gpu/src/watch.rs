@@ -112,6 +112,123 @@ impl Journal {
     }
 }
 
+/// `VICTORY_WATCH_READ_FAST=1` (default off): answer clean guarded view memory
+/// ranges in [`writes`] under shared read locks (`JOURNAL.read` + `GUARDS.read`)
+/// without taking exclusive write locks on either.
+pub(crate) fn watch_read_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_READ_FAST").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_WATCH_UNLOCKED_ASK=1` (default off): run `GetWriteWatch` and `guard()`
+/// outside the global `JOURNAL.write()` lock, serialized only per 16 MiB address stripe
+/// (`STRIPES: [RwLock<()>; 64]`) so concurrent threads on disjoint ranges run in parallel
+/// without losing writes or deadlocking.
+pub(crate) fn watch_unlocked_ask() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_UNLOCKED_ASK").is_some_and(|v| v == "1"))
+}
+
+const WATCH_STRIPES: usize = 64;
+const PAGES_PER_STRIPE: usize = 256; // 256 * 64 KiB = 16 MiB per stripe
+
+static STRIPES: [std::sync::RwLock<()>; WATCH_STRIPES] =
+    [const { std::sync::RwLock::new(()) }; WATCH_STRIPES];
+
+/// Sorted, deduplicated stripe indices covering 64 KiB pages `[first, last)`.
+fn stripe_indices(first: usize, last: usize) -> Vec<usize> {
+    if first >= last {
+        return Vec::new();
+    }
+    let s0 = first / PAGES_PER_STRIPE;
+    let s1 = (last - 1) / PAGES_PER_STRIPE;
+    if s1 - s0 + 1 >= WATCH_STRIPES {
+        return (0..WATCH_STRIPES).collect();
+    }
+    let mut out: Vec<usize> = (s0..=s1).map(|s| s & (WATCH_STRIPES - 1)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `[0]` clean read-fast hits, `[1]` slow-path calls in `writes`,
+/// `[2]` microseconds spent in slow path, `[3]` slow `GetWriteWatch` calls, `[4]` slow `guard()` calls.
+pub(crate) static WATCH_FAST_STATS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// `VICTORY_GUARD_ABSENT_FAST=1` (default off): allow [`try_clean_view_read`] to
+/// treat known-unmapped (`g.absent`) placeholder holes as clean under shared read locks
+/// (`title_memory_remapped` immediately clears `g.absent` whenever `xmem` maps a view).
+pub(crate) fn guard_absent_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ABSENT_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Shared-read fast check for clean (and optionally known-absent) guarded view memory
+/// `[first, last)` (64 KiB pages).
+fn try_clean_view_read_ex(
+    j: &Journal,
+    g: &Guards,
+    first: usize,
+    last: usize,
+    trust_absent: bool,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    if j.asked == 0 || first >= last {
+        return None;
+    }
+    let covered = if trust_absent {
+        g.clean.all_present_with(&g.absent, first, last)
+    } else {
+        g.clean.all_present(first, last)
+    };
+    if !covered {
+        return None;
+    }
+    Some((
+        j.asked,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Shared-read fast check for clean guarded view memory `[first, last)` (64 KiB pages).
+/// Caller holds `JOURNAL.read()` and `GUARDS.read()` (exact same lock order as write path).
+fn try_clean_view_read(
+    j: &Journal,
+    g: &Guards,
+    first: usize,
+    last: usize,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    if j.asked == 0 || first >= last || !g.clean.all_present(first, last) {
+        return None;
+    }
+    Some((
+        j.asked,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+pub(crate) fn fast_stats_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let fast = WATCH_FAST_STATS[0].swap(0, Relaxed) as f64 / frames;
+    let slow = WATCH_FAST_STATS[1].swap(0, Relaxed) as f64 / frames;
+    let slow_ms = WATCH_FAST_STATS[2].swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let gww = WATCH_FAST_STATS[3].swap(0, Relaxed) as f64 / frames;
+    let grd = WATCH_FAST_STATS[4].swap(0, Relaxed) as f64 / frames;
+    if fast + slow > 0.0 {
+        tracing::info!(
+            "watch::writes per frame (FAST={}, UNLOCKED={}): {fast:.0} read-fast, {slow:.0} slow ({slow_ms:.2} ms: {gww:.0} GetWriteWatch, {grd:.0} guard)",
+            u8::from(watch_read_fast()),
+            u8::from(watch_unlocked_ask()),
+        );
+    }
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -466,6 +583,23 @@ pub(crate) fn ask_once_end() {
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
+/// stands, updating the journal without advancing the global refresh stamp
+/// (caller tracks written ranges per batch via `VICTORY_BATCH_RANGE_FLUSH=1`).
+pub(crate) fn wrote_keep_stamp(at: usize, len: usize) {
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    if !j.kept || len == 0 {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    j.ahead_asked = now;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        whole_4k(page, now);
+        j.written.insert(page, now);
+    }
+}
+
+/// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
@@ -697,10 +831,11 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    use std::sync::atomic::Ordering::Relaxed;
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // Fast parallel path: shared read lock on `JOURNAL` for all `wide_refresh` workers.
+    // Fast parallel path 1: range covered by `ask_once` / `ask_ahead`.
     {
         let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         if j.stands(first, last, guarded) {
@@ -712,11 +847,130 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                     .collect(),
             ));
         }
+        if guarded && watch_read_fast() && !watch_unlocked_ask() {
+            let g = guards_shared();
+            if let Some(ans) = try_clean_view_read_ex(&j, &g, first, last, guard_absent_fast()) {
+                WATCH_FAST_STATS[0].fetch_add(1, Relaxed);
+                return Some(ans);
+            }
+        }
     }
+    if watch_unlocked_ask() {
+        let stripes = stripe_indices(first, last);
+        if guarded && watch_read_fast() {
+            let _sr: Vec<_> = stripes
+                .iter()
+                .map(|&s| STRIPES[s].read().unwrap_or_else(|e| e.into_inner()))
+                .collect();
+            let clean = guards_shared().clean.all_present(first, last);
+            if clean {
+                let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+                if j.asked > 0 && first < last {
+                    WATCH_FAST_STATS[0].fetch_add(1, Relaxed);
+                    return Some((
+                        j.asked,
+                        j.written
+                            .range(first..last)
+                            .map(|(&p, &w)| (p, w))
+                            .collect(),
+                    ));
+                }
+            }
+        }
+        let slow_began = std::time::Instant::now();
+        WATCH_FAST_STATS[1].fetch_add(1, Relaxed);
+        let _sw: Vec<_> = stripes
+            .iter()
+            .map(|&s| STRIPES[s].write().unwrap_or_else(|e| e.into_inner()))
+            .collect();
+        {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            if j.stands(first, last, guarded) {
+                WATCH_FAST_STATS[2].fetch_add(slow_began.elapsed().as_micros() as u64, Relaxed);
+                return Some((
+                    j.ahead_asked,
+                    j.written
+                        .range(first..last)
+                        .map(|(&p, &w)| (p, w))
+                        .collect(),
+                ));
+            }
+        }
+        thread_local! {
+            static FOUND_TLS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let known_view = guarded && known_view(first * PAGE);
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        let mut granularity = 0;
+        let mut gww_pages: Vec<usize> = Vec::new();
+        let failed = if known_view {
+            true
+        } else {
+            WATCH_FAST_STATS[3].fetch_add(1, Relaxed);
+            FOUND_TLS.with(|buf| {
+                let mut found = buf.borrow_mut();
+                if found.len() < count {
+                    found.resize(count, 0);
+                }
+                let f = unsafe {
+                    GetWriteWatch(
+                        WRITE_WATCH_FLAG_RESET,
+                        (first * PAGE) as *const _,
+                        (last - first) * PAGE,
+                        found.as_mut_ptr().cast(),
+                        &mut count,
+                        &mut granularity,
+                    )
+                } != 0;
+                if !f && count > 0 {
+                    gww_pages.extend_from_slice(&found[..count]);
+                }
+                f
+            })
+        };
+        let guarded_pages = if failed {
+            if !guarded {
+                WATCH_FAST_STATS[2].fetch_add(slow_began.elapsed().as_micros() as u64, Relaxed);
+                return None;
+            }
+            WATCH_FAST_STATS[4].fetch_add(1, Relaxed);
+            match guard(first * PAGE, last * PAGE) {
+                Some(w) => w,
+                None => {
+                    WATCH_FAST_STATS[2].fetch_add(slow_began.elapsed().as_micros() as u64, Relaxed);
+                    return None;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+        j.asked += 1;
+        let now = j.asked;
+        for addr in gww_pages {
+            found_4k(addr, now);
+            j.written.insert(addr / PAGE, now);
+        }
+        for page in guarded_pages {
+            whole_4k(page, now);
+            j.written.insert(page, now);
+        }
+        let out = j
+            .written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect();
+        drop(j);
+        WATCH_FAST_STATS[2].fetch_add(slow_began.elapsed().as_micros() as u64, Relaxed);
+        return Some((now, out));
+    }
+    let slow_began = std::time::Instant::now();
+    WATCH_FAST_STATS[1].fetch_add(1, Relaxed);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead while waiting on the write lock: the journal has it.
     if j.stands(first, last, guarded) {
+        WATCH_FAST_STATS[2].fetch_add(slow_began.elapsed().as_micros() as u64, Relaxed);
         return Some((
             j.ahead_asked,
             j.written
@@ -734,6 +988,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    if !known_view {
+        WATCH_FAST_STATS[3].fetch_add(1, Relaxed);
+    }
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -760,6 +1017,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if !guarded {
             return None;
         }
+        WATCH_FAST_STATS[4].fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
@@ -787,6 +1045,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         whole_4k(page, now);
         j.written.insert(page, now);
     }
+    WATCH_FAST_STATS[2].fetch_add(
+        slow_began.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Some((
         now,
         j.written
@@ -956,6 +1218,38 @@ impl BlockSet {
         true
     }
 
+    /// True if every block in `[first, last)` is present in `self` OR in `other`.
+    fn all_present_with(&self, other: &BlockSet, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        let mut at = first;
+        while at < last {
+            let reg = at >> 8;
+            let w_a = self.regions.get(&reg);
+            let w_b = other.regions.get(&reg);
+            if w_a.is_none() && w_b.is_none() {
+                return false;
+            }
+            let end = ((reg + 1) << 8).min(last);
+            let mut b = at & 255;
+            let b_end = (end - (reg << 8)).min(256);
+            while b < b_end {
+                let w = b >> 6;
+                let lo = b & 63;
+                let hi = ((w + 1) << 6).min(b_end) - (w << 6);
+                let mask = if hi - lo == 64 { u64::MAX } else { ((1u64 << (hi - lo)) - 1) << lo };
+                let combined = w_a.map_or(0, |a| a[w]) | w_b.map_or(0, |b| b[w]);
+                if (combined & mask) != mask {
+                    return false;
+                }
+                b = (w + 1) << 6;
+            }
+            at = end;
+        }
+        true
+    }
+
     fn count_range(&self, first: usize, last: usize) -> usize {
         if first >= last || self.regions.is_empty() {
             return 0;
@@ -1081,9 +1375,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
+        if watch_read_fast() {
+            let g = guards_shared();
+            let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+            if g.clean.all_present(first, last) {
+                return Some(Vec::new());
+            }
+            g.protected.contains(&first) || g.absent.contains(&first)
+        } else {
+            let g = guards();
+            let first = start / BLOCK;
+            g.protected.contains(&first) || g.absent.contains(&first)
+        }
     };
     if !known && !is_view(start, end) {
         return None;
@@ -2345,5 +2648,95 @@ mod mapping_tests {
         drop(reading);
         change.join().unwrap();
         assert!(changed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watch_read_fast_clean_view_skips_write_lock_and_preserves_writes() {
+        let mut j = super::Journal {
+            asked: 5,
+            written: std::collections::BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_views: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        j.written.insert(10, 5);
+        j.written.insert(15, 4);
+        let mut g = super::Guards {
+            protected: super::BlockSet::new(),
+            clean: super::BlockSet::new(),
+            absent: super::BlockSet::new(),
+            aliased: super::BlockSet::new(),
+        };
+        g.protected.extend_range(10, 12);
+        g.clean.extend_range(10, 12);
+
+        // Clean range must be answered via shared read path without losing page 10's write mark.
+        let got = super::try_clean_view_read(&j, &g, 10, 12);
+        assert_eq!(got, Some((5, vec![(10, 5)])));
+
+        // Range extending onto an open/dirty block (12 not in clean) must NOT take fast path.
+        assert_eq!(super::try_clean_view_read(&j, &g, 10, 13), None);
+
+        // Uninitialized asking (asked == 0) must NOT take fast path.
+        j.asked = 0;
+        assert_eq!(super::try_clean_view_read(&j, &g, 10, 12), None);
+    }
+
+    #[test]
+    fn watch_unlocked_ask_stripes_cover_range_and_are_strictly_sorted() {
+        // Single stripe
+        assert_eq!(super::stripe_indices(0, 10), vec![0]);
+        // Crossing stripe boundary
+        assert_eq!(super::stripe_indices(255, 257), vec![0, 1]);
+        // Wrapping around 64 stripes: must remain strictly sorted ascending (deadlock-free lock order)
+        let s = super::stripe_indices(63 * 256 + 250, 64 * 256 + 10);
+        assert_eq!(s, vec![0, 63]);
+        // Empty range
+        assert_eq!(super::stripe_indices(10, 10), Vec::<usize>::new());
+        // Full wrap (>= 1 GiB) covers all 64 stripes in ascending order
+        let full = super::stripe_indices(5, 5 + 64 * 256);
+        assert_eq!(full.len(), 64);
+        assert!(full.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn guard_absent_fast_accepts_clean_plus_absent_and_rejects_remapped_or_open() {
+        let mut j = super::Journal {
+            asked: 9,
+            written: std::collections::BTreeMap::new(),
+            found: Vec::new(),
+            ahead: Vec::new(),
+            ahead_views: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        j.written.insert(10, 9);
+        let mut g = super::Guards {
+            protected: super::BlockSet::new(),
+            clean: super::BlockSet::new(),
+            absent: super::BlockSet::new(),
+            aliased: super::BlockSet::new(),
+        };
+        g.protected.extend_range(10, 12);
+        g.clean.extend_range(10, 12);
+        g.absent.extend_range(12, 14);
+
+        // Without trust_absent, mixed clean+absent falls back.
+        assert_eq!(super::try_clean_view_read_ex(&j, &g, 10, 14, false), None);
+        // With trust_absent, mixed clean+absent takes fast read path preserving page 10 write.
+        assert_eq!(
+            super::try_clean_view_read_ex(&j, &g, 10, 14, true),
+            Some((9, vec![(10, 9)])),
+            "clean+absent sparse range must hit fast path when trust_absent=true"
+        );
+        // Simulating title_memory_remapped on block 12 (removes from absent): MUST fall back!
+        g.absent.remove(&12);
+        assert_eq!(
+            super::try_clean_view_read_ex(&j, &g, 10, 14, true),
+            None,
+            "remapped hole removed from absent must fall back to guard()"
+        );
     }
 }
