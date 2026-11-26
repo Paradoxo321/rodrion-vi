@@ -2791,6 +2791,44 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// True if any in-flight GPU submission (`LINE.written`) overlaps `[address, address + len)`.
+/// Used by `VICTORY_COPY_ON_GPU_INFLIGHT=1` to catch in-place shadows whose `Shadow::pending`
+/// remains empty (`Shadow::writing` skips `place.is_some()`), eliminating `WHY_READ` settles.
+pub(crate) fn range_in_flight_written(address: usize, len: usize) -> bool {
+    let end = address.saturating_add(len);
+    if end <= address {
+        return false;
+    }
+    let line = line();
+    !line.written.is_empty() && touches(&line.written, address, end)
+}
+
+fn linear_readback_ranges(lists: &[crate::list::Detached], order: &[usize]) -> Vec<(usize, usize)> {
+    order
+        .iter()
+        .flat_map(|&i| {
+            lists[i]
+                .host()
+                .deferred()
+                .backs
+                .iter()
+                .filter(|(_, _, [_, rows, _])| *rows == 1)
+                .map(|(_, at, [row, _, _])| (*at, at.saturating_add(*row)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Rebuilds `LINE.written` for remaining in-flight submissions after earlier flights land.
+fn rebuild_written_ranges(
+    back_ranges: impl IntoIterator<Item = (usize, usize)>,
+    readback_ranges: impl IntoIterator<Item = (usize, usize)>,
+) -> Vec<(usize, usize)> {
+    let mut written = Vec::new();
+    join_ranges(&mut written, back_ranges.into_iter().chain(readback_ranges));
+    written
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2799,50 +2837,60 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         return None;
     }
     for list in runs {
-        for step in &list.deferred().copies {
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                            static LOGGED: std::sync::atomic::AtomicU32 =
-                                std::sync::atomic::AtomicU32::new(0);
-                            if LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
-                                let src_hit = touches(written, src, src + len);
-                                let dst_hit = touches(written, dst, dst + len);
-                                tracing::info!(
-                                    src = format_args!("{src:#x}"),
-                                    dst = format_args!("{dst:#x}"),
-                                    len,
-                                    src_hit,
-                                    dst_hit,
-                                    "WHY_READ settle triggered by Step::Copy"
-                                );
-                            }
+        if let Some(why) = blocked_by_steps(written, &list.deferred().copies, count) {
+            return Some(why);
+        }
+    }
+    None
+}
+
+fn blocked_by_steps(written: &[(usize, usize)], steps: &[Step], count: bool) -> Option<usize> {
+    if written.is_empty() {
+        return None;
+    }
+    for step in steps {
+        match step {
+            &Step::Copy(dst, src, len) => {
+                if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    if count {
+                        LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                        static LOGGED: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        if LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                            let src_hit = touches(written, src, src + len);
+                            let dst_hit = touches(written, dst, dst + len);
+                            tracing::info!(
+                                src = format_args!("{src:#x}"),
+                                dst = format_args!("{dst:#x}"),
+                                len,
+                                src_hit,
+                                dst_hit,
+                                "WHY_READ settle triggered by Step::Copy"
+                            );
                         }
-                        return Some(WHY_READ);
                     }
+                    return Some(WHY_READ);
                 }
-                &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
-                    }
-                }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
+            &Step::Fill(_, src, len) => {
+                if touches(written, src, src + len) {
+                    if count {
+                        LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(WHY_READ);
+                }
+            }
+            Step::Texture(staging) => {
+                let (at, len) = staging.memory();
+                if touches(written, at, at + len) {
+                    if count {
+                        LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Some(WHY_READ);
+                }
+            }
+            Step::Run(_) => return Some(WHY_RUN),
+            Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
         }
     }
     None
@@ -4681,16 +4729,17 @@ impl Host {
             kept.extend(landed);
             in_hand.clear();
             // What is still in the air, from the flights that are.
-            written.clear();
             *lists = 0;
-            let mut ranges = Vec::new();
+            let mut back_ranges = Vec::new();
+            let mut readback_ranges = Vec::new();
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    back_ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    readback_ranges.extend(linear_readback_ranges(&flight.lists, &flight.order));
                 }
             }
-            join_ranges(written, ranges);
+            *written = rebuild_written_ranges(back_ranges, readback_ranges);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -4882,19 +4931,7 @@ impl Host {
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
             // Linear buffer read-backs (e.g. VICTORY_COPY_ON_GPU=1) land in title memory
             // when this flight settles: track them in `written` so any later GPU read waits.
-            join_ranges(
-                written,
-                order.iter().flat_map(|&i| {
-                    lists[i]
-                        .host()
-                        .deferred()
-                        .backs
-                        .iter()
-                        .filter(|(_, _, [_, rows, _])| *rows == 1)
-                        .map(|(_, at, [row, _, _])| (*at, at.saturating_add(*row)))
-                        .collect::<Vec<_>>()
-                }),
-            );
+            join_ranges(written, linear_readback_ranges(&lists, &order));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -7781,13 +7818,14 @@ impl Meter {
             }
         }
         {
-            let [gpu_copies, gpu_bytes, skipped_dst] = [0, 1, 2].map(|i| {
+            let [gpu_copies, gpu_bytes, skipped_dst, inflight_hits] = [0, 1, 2, 3].map(|i| {
                 crate::list::COPY_ON_GPU_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
             });
-            if gpu_copies + skipped_dst > 0.0 {
+            if gpu_copies + skipped_dst + inflight_hits > 0.0 {
                 tracing::info!(
-                    "copy_buffer_region on GPU per frame (VICTORY_COPY_ON_GPU={}): {gpu_copies:.1} GPU readbacks ({:.1} KiB), {skipped_dst:.1} kept CPU (dst shadowed)",
+                    "copy_buffer_region on GPU per frame (VICTORY_COPY_ON_GPU={}, INFLIGHT={}): {gpu_copies:.1} GPU readbacks ({:.1} KiB, {inflight_hits:.1} in-flight), {skipped_dst:.1} kept CPU (dst shadowed)",
                     u8::from(crate::list::copy_on_gpu()),
+                    u8::from(crate::list::copy_on_gpu_inflight()),
                     gpu_bytes / 1024.0,
                 );
             }
@@ -8899,5 +8937,66 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let flushed_edge = st.on_title_write(0x0C000, 0x4000, true);
         assert!(flushed_edge.is_empty(), "half-open edge must not flush R1");
         assert_eq!(st.refreshes.len(), 1);
+    }
+
+    #[test]
+    fn linear_readback_ranges_preserved_on_written_rebuild() {
+        let back_ranges = vec![(0x2acb_afe0usize, 0x2acb_afe0usize + 20480)];
+        let readback_at = 0x9_8be5_c430usize;
+        let readback_ranges = vec![(readback_at, readback_at + 20480)];
+        let rebuilt = super::rebuild_written_ranges(back_ranges, readback_ranges);
+        assert!(
+            super::touches(&rebuilt, readback_at, readback_at + 20480),
+            "remaining in-flight linear readback dst {readback_at:#x}+20480 must stay tracked in LINE.written after relay_land"
+        );
+    }
+
+    #[test]
+    fn range_in_flight_written_detects_line_written_overlap() {
+        let src = 0x2acb_afe0usize;
+        let len = 20480usize;
+        let prev = {
+            let mut line = super::line();
+            let old = line.written.clone();
+            super::join_ranges(&mut line.written, [(src, src + len)]);
+            old
+        };
+        struct Restore(Vec<(usize, usize)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::line().written = std::mem::take(&mut self.0);
+            }
+        }
+        let _restore = Restore(prev);
+        assert!(
+            super::range_in_flight_written(src, len),
+            "in-flight write tracked in LINE.written must be detected even when Shadow::pending is empty"
+        );
+        assert!(
+            !super::range_in_flight_written(src + 0x10_0000, len),
+            "disjoint range must not report in-flight write"
+        );
+    }
+
+    #[test]
+    fn gpu_readback_step_avoids_why_read_settle_unlike_step_copy() {
+        let src = 0x2acb_afe0usize;
+        let dst = 0x9_8be5_c430usize;
+        let len = 20480usize;
+        let written = vec![(src, src + len)];
+        // Old CPU path records `Step::Copy`, forcing a blocking `WHY_READ` settle.
+        let legacy_steps = [super::Step::Copy(dst, src, len)];
+        assert_eq!(
+            super::blocked_by_steps(&written, &legacy_steps, false),
+            Some(super::WHY_READ),
+            "Step::Copy overlapping in-flight shader write triggers WHY_READ settle"
+        );
+        // GPU-side CopyBufferRegion + defer_read_back records no `Step::Copy` against `src`.
+        let gpu_steps: [super::Step; 0] = [];
+        assert_eq!(
+            super::blocked_by_steps(&written, &gpu_steps, false),
+            None,
+            "GPU readback route must avoid WHY_READ blocking settle"
+        );
     }
 }

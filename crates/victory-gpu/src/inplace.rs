@@ -1762,6 +1762,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warp_copy_on_gpu_inplace_readback_20480_matches_cpu_exact() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        const LEN: usize = 20480;
+        const OFFSET: usize = 0xafe0;
+        // SAFETY: self-contained private allocation + WARP readback verification.
+        unsafe {
+            let base = mem::VirtualAlloc(
+                std::ptr::null(),
+                4 * K64,
+                mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH,
+                mem::PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!base.is_null());
+            let src_start = base as u64 + K64 as u64 + OFFSET as u64;
+            let placed = place_part(&device, src_start, LEN as u64)
+                .unwrap_or_else(|e| panic!("place_part failed: {e:?}"));
+            let mut rig = Rig::new(&device).unwrap();
+            let gpu_written: Vec<u8> = (0..LEN).map(|i| ((i * 131 + 17) & 0xFF) as u8).collect();
+            // Simulate shader write landing in in-place memory via GPU store.
+            rig.store(&placed.buffer, placed.bias, &gpu_written).unwrap();
+            // Read back 20480 bytes with CopyBufferRegion into D3D12_HEAP_TYPE_READBACK.
+            let gpu_readback = rig.fetch(&placed.buffer, placed.bias, LEN).unwrap();
+            // Compare bit-for-bit against CPU copy_nonoverlapping from title memory.
+            let mut cpu_copy = vec![0u8; LEN];
+            std::ptr::copy_nonoverlapping(src_start as *const u8, cpu_copy.as_mut_ptr(), LEN);
+            assert_eq!(gpu_readback, cpu_copy, "GPU readback of in-place 20480B must match CPU copy");
+            drop(placed);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
     /// The census names each kind of memory.
     #[test]
     fn census_tells_private_memory_from_views() {

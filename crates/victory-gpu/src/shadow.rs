@@ -4234,6 +4234,36 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Looks up an already-created shadow covering `[address, address + len)`
+/// without creating a new loose window if none exists.
+pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_read();
+        if let Some((_, e)) = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            && let Some(shadow) = &e.shadow
+        {
+            return Some(shadow.clone());
+        }
+    }
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = loose
+        .range(..=(address, u64::MAX))
+        .rev()
+        .take(64)
+        .filter(|&(&(start, bytes), _)| start <= address && start.saturating_add(bytes) >= end)
+        .max_by_key(|&(&(start, bytes), _)| (bytes, std::cmp::Reverse(start)))
+        .map(|(_, s)| s.clone());
+    if let Some(shadow) = &hit {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    }
+    hit
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     // (Neptune) Fast path: shared read lock for the 99.9% case where the buffer's
@@ -4999,6 +5029,16 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    #[test]
+    fn find_existing_returns_none_without_allocating_loose_shadow() {
+        let addr = 0x9_8be5_c430u64;
+        let len = 20480u64;
+        let before = super::LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(super::find_existing(addr, len).is_none());
+        let after = super::LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(after, before, "find_existing must never allocate a loose shadow");
     }
 }
 
