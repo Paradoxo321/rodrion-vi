@@ -1639,6 +1639,15 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     made.clone()
 }
 
+/// A title texture's host copy if it is made; not made here (`VICTORY_TABLE_MEMO`).
+#[cfg(windows)]
+pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    hosted(this, false).map(|made| made.0)
+}
+
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]

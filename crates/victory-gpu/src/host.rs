@@ -857,6 +857,9 @@ mod tests {
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Monotonic epoch bumped whenever this list changes state that draw
+    /// descriptor preparation depends on (`VICTORY_TABLE_MEMO`).
+    epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -3966,6 +3969,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 list,
+                epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -6228,6 +6232,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.changed_something();
         self.take_coming();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -6261,6 +6266,23 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
+    /// Something changed in this list that bringing a draw's textures and
+    /// buffers up to date depends on: a texture's state, a twin, a buffer
+    /// barrier, or a deferred title-memory write (`VICTORY_TABLE_MEMO`).
+    pub(crate) fn changed_something(&self) {
+        self.epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// How many deferred steps the list has queued (for `VICTORY_TABLE_MEMO=verify`).
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
+    /// See [`HostList::changed_something`].
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -6277,10 +6299,14 @@ impl HostList {
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, copy));
+                self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.changed_something();
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
@@ -6291,6 +6317,7 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        self.changed_something();
         let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -6355,6 +6382,7 @@ impl HostList {
                 writing: false,
                 late: false,
             });
+        let was = (u.needs, u.behind, u.writing);
         let copy = match u.behind[side] {
             Some(behind) => behind,
             None => {
@@ -6370,6 +6398,9 @@ impl HostList {
             (true, true) => u.writing = true,
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
+        }
+        if was != (u.needs, u.behind, u.writing) || copy || colour {
+            self.changed_something();
         }
         // shortcut: the depth plane's twin is not drawn into the plane
         // here: the pass sets a pipeline and a target of ours, which a list
@@ -6506,6 +6537,7 @@ impl HostList {
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
             u.behind[0] = Some(true);
+            self.changed_something();
         }
     }
 
@@ -6520,6 +6552,7 @@ impl HostList {
     pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
+            self.changed_something();
             let barrier = transition(
                 buffer,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -6839,6 +6872,8 @@ impl HostList {
             COPIES_JOINED[1].fetch_add(1, Ordering::Relaxed);
             if join_copies() {
                 *n += len;
+                drop(deferred);
+                self.changed_something();
                 return;
             }
         }
@@ -6846,6 +6881,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.title_written();
+        drop(deferred);
+        self.changed_something();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7136,6 +7173,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.title_written();
+        drop(deferred);
+        self.changed_something();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7755,6 +7794,11 @@ fn write_mapped_now(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+fn next_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
@@ -8299,6 +8343,7 @@ impl Meter {
                 );
             }
         }
+        crate::draw::table_memo_line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         crate::watch::fast_stats_line(frames);
