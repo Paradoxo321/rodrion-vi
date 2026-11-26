@@ -2237,6 +2237,15 @@ struct Deferred {
     /// Submit-time GPU->READBACK copies recorded into this list's prelude
     /// (`VICTORY_COPY_ON_GPU_INFLIGHT=1`): `(source_shadow, src_offset, readback_buf, bytes)`.
     gpu_readback_copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, ID3D12Resource, u64)>,
+    /// Submit-time GPU->GPU shadow copies recorded into this list's prelude
+    /// (`VICTORY_COPY_ON_GPU_INFLIGHT=1`): `(src_shadow, src_off, dst_shadow, dst_off, bytes)`.
+    gpu_s2s_copies: Vec<(
+        std::sync::Arc<crate::shadow::Shadow>,
+        u64,
+        std::sync::Arc<crate::shadow::Shadow>,
+        u64,
+        u64,
+    )>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2904,7 +2913,7 @@ enum CopyDescKind {
     Copy { dst: usize, src: usize, len: usize },
     Fill { src: usize, len: usize },
     Texture { at: usize, len: usize },
-    Refresh { addr: usize, len: usize },
+    Refresh { shadow_id: usize, addr: usize, len: usize },
     GpuWrite { addr: usize, len: usize },
     Run,
     Other,
@@ -2918,12 +2927,35 @@ struct CopyDesc {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffloadTarget<D> {
+    Readback,
+    ShadowToShadow(D),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlannedOffload<P, D> {
+    list_idx: usize,
+    step_idx: usize,
+    src_shadow: P,
+    target: OffloadTarget<D>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OffloadDeclineReason {
     DstHit,
     DstShadowed,
     LinearRbSrc,
     TooLarge,
-    IntraHazard,
+    IntraRun,
+    IntraSrcWrite,
+    IntraDstCopy,
+    IntraDstFill,
+    IntraDstTexture,
+    IntraDstRefreshBefore,
+    IntraDstRefreshOtherShadow,
+    IntraSrcGpuWriteBefore,
+    SameShadow,
+    DstBufferConflict,
     NoUniqueProducer,
 }
 
@@ -2934,7 +2966,16 @@ impl OffloadDeclineReason {
             Self::DstShadowed => "dst_shadowed",
             Self::LinearRbSrc => "linear_rb_src",
             Self::TooLarge => "too_large",
-            Self::IntraHazard => "intra_hazard",
+            Self::IntraRun => "intra_run",
+            Self::IntraSrcWrite => "intra_src_write",
+            Self::IntraDstCopy => "intra_dst_copy",
+            Self::IntraDstFill => "intra_dst_fill",
+            Self::IntraDstTexture => "intra_dst_texture",
+            Self::IntraDstRefreshBefore => "intra_dst_refresh_before",
+            Self::IntraDstRefreshOtherShadow => "intra_dst_refresh_other_shadow",
+            Self::IntraSrcGpuWriteBefore => "intra_src_gpu_write_before",
+            Self::SameShadow => "same_shadow",
+            Self::DstBufferConflict => "dst_buffer_conflict",
             Self::NoUniqueProducer => "no_unique_producer",
         }
     }
@@ -2945,22 +2986,32 @@ fn ranges_overlap(a0: usize, a_len: usize, b0: usize, b_len: usize) -> bool {
     a_len > 0 && b_len > 0 && a0 < b0.saturating_add(b_len) && b0 < a0.saturating_add(a_len)
 }
 
-/// Plans submit-time GPU->READBACK offload for `Step::Copy` steps whose source
-/// touches `LINE.written`. Returns `(planned_steps, declined_reasons)`.
-#[allow(clippy::type_complexity)]
-fn plan_submit_copy_offload<P>(
+/// Plans submit-time GPU offload (`Readback` or `ShadowToShadow`) for `Step::Copy`
+/// steps whose source touches `LINE.written`.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn plan_submit_copy_offload<P, D>(
     written: &[(usize, usize)],
     linear_rb_written: &[(usize, usize)],
     copies: &[CopyDesc],
-    find_producer: impl Fn(usize, usize) -> Option<P>,
-    dst_shadowed: impl Fn(usize, usize) -> bool,
-) -> (Vec<(usize, usize, P)>, Vec<(usize, usize, usize, OffloadDeclineReason)>) {
+    find_producer: impl Fn(usize, usize) -> Option<(usize, usize, P)>,
+    find_dst: impl Fn(usize, usize) -> Option<(usize, usize, D)>,
+    cbv_src_bufs: &[std::collections::HashSet<usize>],
+    dst_any_shadow: impl Fn(usize, usize) -> bool,
+) -> (Vec<PlannedOffload<P, D>>, Vec<(usize, usize, usize, OffloadDeclineReason)>) {
+    use std::collections::{HashMap, HashSet};
     let mut planned = Vec::new();
     let mut declined = Vec::new();
     if written.is_empty() {
         return (planned, declined);
     }
     let has_run = copies.iter().any(|c| matches!(c.kind, CopyDescKind::Run));
+    let mut prelude_srcs: HashMap<usize, HashSet<usize>> = cbv_src_bufs
+        .iter()
+        .enumerate()
+        .map(|(idx, set)| (idx, set.clone()))
+        .collect();
+    let mut prelude_dsts: HashMap<usize, HashSet<usize>> = HashMap::new();
+
     for (i, desc) in copies.iter().enumerate() {
         let CopyDescKind::Copy { dst, src, len } = desc.kind else {
             continue;
@@ -2983,10 +3034,21 @@ fn plan_submit_copy_offload<P>(
             continue;
         }
         if has_run {
-            declined.push((dst, src, len, OffloadDeclineReason::IntraHazard));
+            declined.push((dst, src, len, OffloadDeclineReason::IntraRun));
             continue;
         }
-        let mut hazard = false;
+
+        let Some((src_shadow_id, src_buf_raw, producer)) = find_producer(src, len) else {
+            declined.push((dst, src, len, OffloadDeclineReason::NoUniqueProducer));
+            continue;
+        };
+        let dst_resolved = find_dst(dst, len);
+        if dst_resolved.is_none() && dst_any_shadow(dst, len) {
+            declined.push((dst, src, len, OffloadDeclineReason::DstShadowed));
+            continue;
+        }
+
+        let mut hazard = None;
         for (j, other) in copies.iter().enumerate() {
             if j == i {
                 continue;
@@ -2994,50 +3056,94 @@ fn plan_submit_copy_offload<P>(
             match other.kind {
                 CopyDescKind::Copy { dst: d2, src: s2, len: l2 } => {
                     if ranges_overlap(d2, l2, src, len) {
-                        hazard = true;
+                        hazard = Some(OffloadDeclineReason::IntraSrcWrite);
                         break;
                     }
                     if j > i && (ranges_overlap(s2, l2, dst, len) || ranges_overlap(d2, l2, dst, len)) {
-                        hazard = true;
+                        hazard = Some(OffloadDeclineReason::IntraDstCopy);
                         break;
                     }
                 }
                 CopyDescKind::Fill { src: s2, len: l2 } if j > i && ranges_overlap(s2, l2, dst, len) => {
-                    hazard = true;
+                    hazard = Some(OffloadDeclineReason::IntraDstFill);
                     break;
                 }
                 CopyDescKind::Texture { at, len: l2 } if j > i && ranges_overlap(at, l2, dst, len) => {
-                    hazard = true;
+                    hazard = Some(OffloadDeclineReason::IntraDstTexture);
                     break;
                 }
-                CopyDescKind::Refresh { addr, len: l2 } if j > i && ranges_overlap(addr, l2, dst, len) => {
-                    hazard = true;
-                    break;
+                CopyDescKind::Refresh { shadow_id, addr, len: l2 } => {
+                    if ranges_overlap(addr, l2, dst, len) {
+                        if other.list_idx == desc.list_idx && j < i {
+                            hazard = Some(OffloadDeclineReason::IntraDstRefreshBefore);
+                            break;
+                        }
+                        if j > i {
+                            match &dst_resolved {
+                                Some((dst_shadow_id, _, _)) if *dst_shadow_id == shadow_id => {}
+                                _ => {
+                                    hazard = Some(OffloadDeclineReason::IntraDstRefreshOtherShadow);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 CopyDescKind::GpuWrite { addr, len: l2 }
                     if other.list_idx == desc.list_idx
                         && j < i
                         && ranges_overlap(addr, l2, src, len) =>
                 {
-                    hazard = true;
+                    hazard = Some(OffloadDeclineReason::IntraSrcGpuWriteBefore);
                     break;
                 }
                 _ => {}
             }
         }
-        if hazard {
-            declined.push((dst, src, len, OffloadDeclineReason::IntraHazard));
+        if let Some(reason) = hazard {
+            declined.push((dst, src, len, reason));
             continue;
         }
-        if dst_shadowed(dst, len) {
-            declined.push((dst, src, len, OffloadDeclineReason::DstShadowed));
-            continue;
+
+        if let Some((dst_shadow_id, dst_buf_raw, dst_shadow)) = dst_resolved {
+            if dst_shadow_id == src_shadow_id || dst_buf_raw == src_buf_raw {
+                declined.push((dst, src, len, OffloadDeclineReason::SameShadow));
+                continue;
+            }
+            let src_conflict = prelude_srcs
+                .get(&desc.list_idx)
+                .is_some_and(|s| s.contains(&dst_buf_raw));
+            let dst_conflict = prelude_dsts
+                .get(&desc.list_idx)
+                .is_some_and(|s| s.contains(&src_buf_raw));
+            if src_conflict || dst_conflict {
+                declined.push((dst, src, len, OffloadDeclineReason::DstBufferConflict));
+                continue;
+            }
+            prelude_srcs.entry(desc.list_idx).or_default().insert(src_buf_raw);
+            prelude_dsts.entry(desc.list_idx).or_default().insert(dst_buf_raw);
+            planned.push(PlannedOffload {
+                list_idx: desc.list_idx,
+                step_idx: desc.step_idx,
+                src_shadow: producer,
+                target: OffloadTarget::ShadowToShadow(dst_shadow),
+            });
+        } else {
+            let dst_conflict = prelude_dsts
+                .get(&desc.list_idx)
+                .is_some_and(|s| s.contains(&src_buf_raw));
+            if dst_conflict {
+                declined.push((dst, src, len, OffloadDeclineReason::DstBufferConflict));
+                continue;
+            }
+            prelude_srcs.entry(desc.list_idx).or_default().insert(src_buf_raw);
+            planned.push(PlannedOffload {
+                list_idx: desc.list_idx,
+                step_idx: desc.step_idx,
+                src_shadow: producer,
+                target: OffloadTarget::Readback,
+            });
         }
-        let Some(producer) = find_producer(src, len) else {
-            declined.push((dst, src, len, OffloadDeclineReason::NoUniqueProducer));
-            continue;
-        };
-        planned.push((desc.list_idx, desc.step_idx, producer));
     }
     (planned, declined)
 }
@@ -5340,7 +5446,11 @@ impl Host {
                         let (at, len) = staging.memory();
                         CopyDescKind::Texture { at, len }
                     }
-                    &Step::Refresh(_, addr, len) => CopyDescKind::Refresh { addr, len },
+                    &Step::Refresh(ref s, addr, len) => CopyDescKind::Refresh {
+                        shadow_id: Arc::as_ptr(s) as usize,
+                        addr,
+                        len,
+                    },
                     &Step::GpuWrite(_, addr, len) => CopyDescKind::GpuWrite { addr, len },
                     Step::Run(_) => CopyDescKind::Run,
                     Step::Host(_) => CopyDescKind::Other,
@@ -5348,7 +5458,7 @@ impl Host {
                 copies.push(CopyDesc { list_idx, step_idx, kind });
             }
         }
-        let find_producer = |src: usize, len: usize| -> Option<Arc<crate::shadow::Shadow>> {
+        let find_producer = |src: usize, len: usize| -> Option<(usize, usize, Arc<crate::shadow::Shadow>)> {
             let src_end = src.saturating_add(len);
             let mut found: Option<&Arc<crate::shadow::Shadow>> = None;
             for (shadow, ranges) in &flight_backs {
@@ -5363,16 +5473,38 @@ impl Host {
             let shadow = found?;
             let (s_start, s_len) = shadow.span();
             if s_start <= src as u64 && s_start.saturating_add(s_len) >= src_end as u64 {
-                Some(shadow.clone())
+                Some((Arc::as_ptr(shadow) as usize, shadow.buffer.as_raw() as usize, shadow.clone()))
             } else {
                 None
             }
         };
-        let (planned, declined) = plan_submit_copy_offload(
+        let cbv_src_bufs: Vec<std::collections::HashSet<usize>> = runs
+            .iter()
+            .map(|list| {
+                list.deferred()
+                    .gpu_cbv_copies
+                    .iter()
+                    .map(|(s, _, _, _, _)| s.buffer.as_raw() as usize)
+                    .collect()
+            })
+            .collect();
+        let find_dst = |dst: usize, len: usize| -> Option<(usize, usize, Arc<crate::shadow::Shadow>)> {
+            let shadow = crate::shadow::find_existing(dst as u64, len as u64)?;
+            let (s_start, s_len) = shadow.span();
+            let dst_end = dst.saturating_add(len);
+            if s_start <= dst as u64 && s_start.saturating_add(s_len) >= dst_end as u64 {
+                Some((Arc::as_ptr(&shadow) as usize, shadow.buffer.as_raw() as usize, shadow))
+            } else {
+                None
+            }
+        };
+        let (planned, declined) = plan_submit_copy_offload::<Arc<crate::shadow::Shadow>, Arc<crate::shadow::Shadow>>(
             &written,
             &linear_rb_written,
             &copies,
             find_producer,
+            find_dst,
+            &cbv_src_bufs,
             |dst, len| crate::shadow::find_existing(dst as u64, len as u64).is_some(),
         );
         for (dst, src, len, reason) in declined {
@@ -5391,26 +5523,49 @@ impl Host {
                 );
             }
         }
-        // Iterate in reverse order so `Vec::remove(step_idx)` preserves earlier indices in each list.
-        for (list_idx, step_idx, src_shadow) in planned.into_iter().rev() {
+        // Iterate in reverse order so `remove`/`insert` preserves earlier indices in each list.
+        for item in planned.into_iter().rev() {
+            let (list_idx, step_idx, src_shadow, target) =
+                (item.list_idx, item.step_idx, item.src_shadow, item.target);
             let (dst, src, len) = match runs[list_idx].deferred().copies.get(step_idx) {
                 Some(&Step::Copy(dst, src, len)) => (dst, src, len),
                 _ => continue,
             };
-            let Some(rb) = self.read_back_buffer(len as u64) else {
-                continue;
-            };
-            let mut deferred = runs[list_idx].deferred();
-            let Some(&Step::Copy(d2, s2, l2)) = deferred.copies.get(step_idx) else {
-                continue;
-            };
-            if (d2, s2, l2) != (dst, src, len) {
-                continue;
+            match target {
+                OffloadTarget::Readback => {
+                    let Some(rb) = self.read_back_buffer(len as u64) else {
+                        continue;
+                    };
+                    let mut deferred = runs[list_idx].deferred();
+                    let Some(&Step::Copy(d2, s2, l2)) = deferred.copies.get(step_idx) else {
+                        continue;
+                    };
+                    if (d2, s2, l2) != (dst, src, len) {
+                        continue;
+                    }
+                    deferred.copies.remove(step_idx);
+                    let src_off = src_shadow.offset(src as u64);
+                    deferred.gpu_readback_copies.push((src_shadow, src_off, rb.clone(), len as u64));
+                    deferred.backs.push((rb, dst, [len, 1, len]));
+                }
+                OffloadTarget::ShadowToShadow(dst_shadow) => {
+                    let mut deferred = runs[list_idx].deferred();
+                    let Some(&Step::Copy(d2, s2, l2)) = deferred.copies.get(step_idx) else {
+                        continue;
+                    };
+                    if (d2, s2, l2) != (dst, src, len) {
+                        continue;
+                    }
+                    let src_off = src_shadow.offset(src as u64);
+                    let dst_off = dst_shadow.offset(dst as u64);
+                    let in_place_dst = dst_shadow.in_place();
+                    deferred.copies[step_idx] = Step::GpuWrite(dst_shadow.clone(), dst, len);
+                    if !in_place_dst {
+                        deferred.copies.insert(step_idx, Step::Refresh(dst_shadow.clone(), dst, len));
+                    }
+                    deferred.gpu_s2s_copies.push((src_shadow, src_off, dst_shadow, dst_off, len as u64));
+                }
             }
-            deferred.copies.remove(step_idx);
-            let src_off = src_shadow.offset(src as u64);
-            deferred.gpu_readback_copies.push((src_shadow, src_off, rb.clone(), len as u64));
-            deferred.backs.push((rb, dst, [len, 1, len]));
             crate::list::COPY_ON_GPU_STATS[0].fetch_add(1, Relaxed);
             crate::list::COPY_ON_GPU_STATS[1].fetch_add(len as u64, Relaxed);
             crate::list::COPY_ON_GPU_STATS[3].fetch_add(1, Relaxed);
@@ -6444,8 +6599,10 @@ impl HostList {
         drop(states);
         let gpu_copies = self.deferred().gpu_cbv_copies.clone();
         let gpu_rb_copies = self.deferred().gpu_readback_copies.clone();
+        let gpu_s2s_copies = self.deferred().gpu_s2s_copies.clone();
         let mut copied_srcs: std::collections::HashMap<usize, ID3D12Resource> = std::collections::HashMap::new();
         let mut copied_dsts: std::collections::HashMap<usize, ID3D12Resource> = std::collections::HashMap::new();
+        let mut copied_s2s_dsts: std::collections::HashMap<usize, ID3D12Resource> = std::collections::HashMap::new();
         for (shadow, _, dst, _, _) in &gpu_copies {
             copied_srcs
                 .entry(shadow.buffer.as_raw() as usize)
@@ -6459,17 +6616,31 @@ impl HostList {
                 .entry(shadow.buffer.as_raw() as usize)
                 .or_insert_with(|| shadow.buffer.clone());
         }
+        for (src_shadow, _, dst_shadow, _, _) in &gpu_s2s_copies {
+            copied_srcs
+                .entry(src_shadow.buffer.as_raw() as usize)
+                .or_insert_with(|| src_shadow.buffer.clone());
+            copied_s2s_dsts
+                .entry(dst_shadow.buffer.as_raw() as usize)
+                .or_insert_with(|| dst_shadow.buffer.clone());
+        }
         barriers.extend(
             self.buffers
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .firsts()
                 .filter_map(|(b, first)| {
-                    let from = if copied_srcs.remove(&(b.as_raw() as usize)).is_some() {
+                    let raw = b.as_raw() as usize;
+                    let from = if copied_srcs.remove(&raw).is_some() {
                         if first == COPY_SOURCE {
                             return None;
                         }
                         D3D12_RESOURCE_STATE_COPY_SOURCE
+                    } else if copied_s2s_dsts.remove(&raw).is_some() {
+                        if first == COPY_DEST {
+                            return None;
+                        }
+                        D3D12_RESOURCE_STATE_COPY_DEST
                     } else {
                         D3D12_RESOURCE_STATE_COMMON
                     };
@@ -6483,6 +6654,13 @@ impl HostList {
                 D3D12_RESOURCE_STATE_COMMON,
             ));
         }
+        for dst in copied_s2s_dsts.values() {
+            barriers.push(transition(
+                dst,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            ));
+        }
         for dst in copied_dsts.values() {
             barriers.push(transition(
                 dst,
@@ -6490,7 +6668,12 @@ impl HostList {
                 D3D12_RESOURCE_STATE_GENERIC_READ,
             ));
         }
-        if barriers.is_empty() && syncs.is_empty() && gpu_copies.is_empty() && gpu_rb_copies.is_empty() {
+        if barriers.is_empty()
+            && syncs.is_empty()
+            && gpu_copies.is_empty()
+            && gpu_rb_copies.is_empty()
+            && gpu_s2s_copies.is_empty()
+        {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6514,7 +6697,7 @@ impl HostList {
                 for (shadow, src_off, dst, dst_off, size) in &gpu_copies {
                     list.CopyBufferRegion(dst, *dst_off, &shadow.buffer, *src_off, *size);
                 }
-                if !gpu_rb_copies.is_empty() {
+                if !gpu_rb_copies.is_empty() || !gpu_s2s_copies.is_empty() {
                     // Ensure all prior GPU shader UAV writes to `shadow.buffer` are visible.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -6525,6 +6708,15 @@ impl HostList {
                             }),
                         },
                     }]);
+                    for (src_shadow, src_off, dst_shadow, dst_off, size) in &gpu_s2s_copies {
+                        list.CopyBufferRegion(
+                            &dst_shadow.buffer,
+                            *dst_off,
+                            &src_shadow.buffer,
+                            *src_off,
+                            *size,
+                        );
+                    }
                     for (shadow, src_off, rb, size) in &gpu_rb_copies {
                         list.CopyBufferRegion(rb, 0, &shadow.buffer, *src_off, *size);
                     }
@@ -9299,7 +9491,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn submit_copy_offload_plans_20480b_inplace_src_to_unshadowed_dst() {
-        use super::{CopyDesc, CopyDescKind, plan_submit_copy_offload};
+        use super::{CopyDesc, CopyDescKind, OffloadTarget, plan_submit_copy_offload};
         let src = 0x289d_afe0usize;
         let dst = 0x9_8be5_c460usize;
         let len = 20480usize;
@@ -9309,19 +9501,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             step_idx: 0,
             kind: CopyDescKind::Copy { dst, src, len },
         }];
-        let (planned, declined) = plan_submit_copy_offload(
+        let (planned, declined) = plan_submit_copy_offload::<usize, usize>(
             &written,
             &[],
             &copies,
-            |a, l| (a == src && l == len).then_some(42usize),
+            |a, l| (a == src && l == len).then_some((10, 100, 42)),
+            |_, _| None,
+            &[],
             |_, _| false,
         );
         assert!(declined.is_empty(), "expected no declined copy, got {declined:?}");
-        assert_eq!(
-            planned,
-            vec![(0, 0, 42usize)],
-            "submit-time planner must offload 20480B in-place src to unshadowed dst"
-        );
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].src_shadow, 42);
+        assert_eq!(planned[0].target, OffloadTarget::Readback);
     }
 
     #[test]
@@ -9338,33 +9530,39 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         };
 
         // 1. dst overlaps LINE.written -> DstHit
-        let (p, d) = plan_submit_copy_offload(
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(
             &[(src, src + len), (dst, dst + 64)],
             &[],
             &[base_copy],
-            |_, _| Some(1usize),
+            |_, _| Some((10, 100, 1)),
+            |_, _| None,
+            &[],
             |_, _| false,
         );
         assert!(p.is_empty());
         assert_eq!(d[0].3, OffloadDeclineReason::DstHit);
 
-        // 2. dst already shadowed -> DstShadowed
-        let (p, d) = plan_submit_copy_offload(
+        // 2. dst covered only partially by shadow -> DstShadowed
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(
             &written,
             &[],
             &[base_copy],
-            |_, _| Some(1usize),
+            |_, _| Some((10, 100, 1)),
+            |_, _| None,
+            &[],
             |_, _| true,
         );
         assert!(p.is_empty());
         assert_eq!(d[0].3, OffloadDeclineReason::DstShadowed);
 
         // 3. src overlaps linear readback -> LinearRbSrc
-        let (p, d) = plan_submit_copy_offload(
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(
             &written,
             &[(src, src + 64)],
             &[base_copy],
-            |_, _| Some(1usize),
+            |_, _| Some((10, 100, 1)),
+            |_, _| None,
+            &[],
             |_, _| false,
         );
         assert!(p.is_empty());
@@ -9376,38 +9574,156 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             step_idx: 0,
             kind: CopyDescKind::Copy { dst, src, len: (4 << 20) + 1 },
         }];
-        let (p, d) = plan_submit_copy_offload(&written, &[], &big, |_, _| Some(1usize), |_, _| false);
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(&written, &[], &big, |_, _| Some((10, 100, 1)), |_, _| None, &[], |_, _| false);
         assert!(p.is_empty());
         assert_eq!(d[0].3, OffloadDeclineReason::TooLarge);
 
-        // 5. Intra-submission hazards: later Step::Fill/Texture/Refresh reading dst, Step::Copy writing src, or Step::Run
+        // 5. Intra-submission hazards
         let with_later_fill = [
             base_copy,
             CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Fill { src: dst, len: 64 } },
         ];
-        let (p, d) = plan_submit_copy_offload(&written, &[], &with_later_fill, |_, _| Some(1usize), |_, _| false);
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(&written, &[], &with_later_fill, |_, _| Some((10, 100, 1)), |_, _| None, &[], |_, _| false);
         assert!(p.is_empty());
-        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraDstFill);
 
         let with_src_write = [
             CopyDesc { list_idx: 0, step_idx: 0, kind: CopyDescKind::Copy { dst: src, src: 0x5000_0000, len: 64 } },
             CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Copy { dst, src, len } },
         ];
-        let (p, d) = plan_submit_copy_offload(&written, &[], &with_src_write, |_, _| Some(1usize), |_, _| false);
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(&written, &[], &with_src_write, |_, _| Some((10, 100, 1)), |_, _| None, &[], |_, _| false);
         assert!(p.is_empty());
-        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraSrcWrite);
 
         let with_run = [
             base_copy,
             CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Run },
         ];
-        let (p, d) = plan_submit_copy_offload(&written, &[], &with_run, |_, _| Some(1usize), |_, _| false);
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(&written, &[], &with_run, |_, _| Some((10, 100, 1)), |_, _| None, &[], |_, _| false);
         assert!(p.is_empty());
-        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraRun);
 
         // 6. No unique producer -> NoUniqueProducer
-        let (p, d) = plan_submit_copy_offload(&written, &[], &[base_copy], |_, _| None::<usize>, |_, _| false);
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(&written, &[], &[base_copy], |_, _| None, |_, _| None, &[], |_, _| false);
         assert!(p.is_empty());
         assert_eq!(d[0].3, OffloadDeclineReason::NoUniqueProducer);
+    }
+
+    #[test]
+    fn submit_copy_offload_plans_shadow_to_shadow_for_20480b_dst_shadowed() {
+        use super::{CopyDesc, CopyDescKind, OffloadTarget, plan_submit_copy_offload};
+        let src = 0x37c_afe0usize;
+        let dst = 0x9_8be5_c430usize;
+        let len = 20480usize;
+        let written = vec![(src, src + len)];
+        let copies = [CopyDesc {
+            list_idx: 0,
+            step_idx: 0,
+            kind: CopyDescKind::Copy { dst, src, len },
+        }];
+        let (planned, declined) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &copies,
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((20, 200, 20usize)),
+            &[],
+            |_, _| true,
+        );
+        assert!(declined.is_empty(), "dst shadowed with enclosing Shadow must offload via ShadowToShadow, got declined={declined:?}");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].target, OffloadTarget::ShadowToShadow(20usize));
+    }
+
+    #[test]
+    fn submit_copy_offload_allows_later_refresh_on_same_dst_shadow_but_rejects_earlier_or_other() {
+        use super::{CopyDesc, CopyDescKind, OffloadDeclineReason, OffloadTarget, plan_submit_copy_offload};
+        let src = 0x382_a700usize;
+        let dst = 0x9_9361_f000usize;
+        let len = 1376usize;
+        let written = vec![(src, src + len)];
+        let copy0 = CopyDesc { list_idx: 0, step_idx: 0, kind: CopyDescKind::Copy { dst, src, len } };
+
+        // 1. Copy followed by Refresh on SAME dst shadow (20) -> ALLOWED (ShadowToShadow)
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[copy0, CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Refresh { shadow_id: 20, addr: dst, len } }],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((20, 200, 20usize)),
+            &[],
+            |_, _| true,
+        );
+        assert!(d.is_empty(), "later Refresh on same dst shadow must be allowed, got {d:?}");
+        assert_eq!(p[0].target, OffloadTarget::ShadowToShadow(20usize));
+
+        // 2. Refresh on dst shadow BEFORE Copy in SAME list -> DECLINED (IntraDstRefreshBefore)
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[
+                CopyDesc { list_idx: 0, step_idx: 0, kind: CopyDescKind::Refresh { shadow_id: 20, addr: dst, len } },
+                CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Copy { dst, src, len } },
+            ],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((20, 200, 20usize)),
+            &[],
+            |_, _| true,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraDstRefreshBefore);
+
+        // 3. Later Refresh on DIFFERENT shadow (99) -> DECLINED (IntraDstRefreshOtherShadow)
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[copy0, CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Refresh { shadow_id: 99, addr: dst, len } }],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((20, 200, 20usize)),
+            &[],
+            |_, _| true,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraDstRefreshOtherShadow);
+
+        // 4. Same shadow (10 == 10) -> DECLINED (SameShadow)
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[copy0],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((10, 100, 10usize)),
+            &[],
+            |_, _| true,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::SameShadow);
+
+        // 5. dst buffer conflicts with CBV prelude source buffer (200) -> DECLINED (DstBufferConflict)
+        let cbv_bufs = [std::collections::HashSet::from([200usize])];
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[copy0],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| Some((20, 200, 20usize)),
+            &cbv_bufs,
+            |_, _| true,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::DstBufferConflict);
+
+        // 6. Unshadowed dst followed by Refresh -> STILL DECLINED (IntraDstRefreshOtherShadow)
+        let (p, d) = plan_submit_copy_offload::<usize, usize>(
+            &written,
+            &[],
+            &[copy0, CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Refresh { shadow_id: 99, addr: dst, len } }],
+            |_, _| Some((10, 100, 10usize)),
+            |_, _| None,
+            &[],
+            |_, _| false,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraDstRefreshOtherShadow);
     }
 }
