@@ -79,7 +79,7 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{frame_rate, on_failure};
 #[cfg(windows)]
 pub use inplace::{
     title_memory_freeing, title_memory_freeing_sync, title_memory_section,

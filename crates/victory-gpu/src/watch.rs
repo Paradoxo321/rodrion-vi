@@ -855,6 +855,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
         }
     }
+    // Belobug Port 6 (65f9707): view memory the caller asks of the kernel alone
+    // (`guarded == false`, e.g. textures) would always fail `GetWriteWatch`: skip
+    // both `JOURNAL.write()` and the doomed kernel syscall (~300 calls/frame).
+    if !guarded && known_view(first * PAGE) {
+        return None;
+    }
     if watch_unlocked_ask() {
         let stripes = stripe_indices(first, last);
         if guarded && watch_read_fast() {

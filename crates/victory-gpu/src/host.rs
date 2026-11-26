@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 pub(crate) mod aside;
+mod awake;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -2114,9 +2115,19 @@ struct CardRange {
     compared: bool,
 }
 
+/// `VICTORY_CARD_SYNC_INLINE=1` (default off): prepend `card_before`'s sync
+/// command list to the main submission's `ExecuteCommandLists` slice instead of
+/// issuing a separate kernel `ExecuteCommandLists` call (~44 fewer submits/frame).
+fn card_sync_inline() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SYNC_INLINE").is_some_and(|v| v == "1"))
+}
+
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// Optional inline sync list prepended ahead of the submission's lists (`VICTORY_CARD_SYNC_INLINE=1`).
+    sync_list: Option<ID3D12CommandList>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -3928,16 +3939,18 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut sync_inline: Option<ID3D12CommandList> = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            let inline = card_sync_inline();
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
-            let recorded = unsafe {
-                (|| -> windows::core::Result<()> {
+            let recorded: windows::core::Result<Option<ID3D12CommandList>> = unsafe {
+                (|| -> windows::core::Result<Option<ID3D12CommandList>> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // RDNA 2 Batched Sync:
@@ -4009,18 +4022,25 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    Ok(())
+                    let cmd: ID3D12CommandList = list.cast()?;
+                    if inline {
+                        Ok(Some(cmd))
+                    } else {
+                        self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                        Ok(None)
+                    }
                 })()
             };
-            if let Err(e) = recorded {
-                fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
+            match recorded {
+                Ok(cmd) => sync_inline = cmd,
+                Err(e) => fail(format_args!("host copies in the card's memory could not be brought up to date ({e})")),
             }
             used.push((false, sync));
         }
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sync_list: sync_inline,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -5222,9 +5242,16 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(runs, flown);
+        if let Some(sync_cmd) = card.as_ref().and_then(|c| c.sync_list.clone()) {
+            lists.insert(0, Some(sync_cmd));
+            for f in firsts.iter_mut().skip(1) {
+                *f += 1;
+            }
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        awake::sent(&self.device);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -7641,6 +7668,17 @@ struct Presenter {
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
+/// Last 1-second FPS (*10) and draws/frame for Discord Rich Presence (`frame_rate`).
+static FRAME_RATE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+
+/// The last second's frames per second and draws per frame (0 before first present).
+pub fn frame_rate() -> (f64, u32) {
+    (
+        f64::from(FRAME_RATE[0].load(Ordering::Relaxed)) / 10.0,
+        FRAME_RATE[1].load(Ordering::Relaxed),
+    )
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -7686,6 +7724,8 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        FRAME_RATE[0].store((fps * 10.0) as u32, Ordering::Relaxed);
+        FRAME_RATE[1].store(draws as u32, Ordering::Relaxed);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {

@@ -11,17 +11,21 @@ using System.Windows.Forms;
 
 namespace VictoryLauncher
 {
-    sealed class GameVersion
+    sealed class BuildEntry
+    {
+        public string Name;      // e.g. "Atual", "v1.2.0", "v1.1.0-rc1", "v1.0.0"
+        public string Meta;      // commit or date hint
+        public string ExePath;
+        public bool IsLatest;
+    }
+
+    sealed class PresetEntry
     {
         public string Title;
         public string Subtitle;
-        public string Badge;
-        public Color BadgeColor;
-        public string Kind; // "ps1" or "bat"
-        public string Target;
+        public string Tag;
+        public Color TagColor;
         public string Args;
-        public bool SupportsOptions;
-        public bool Available;
     }
 
     sealed class KeyBindingItem
@@ -33,19 +37,179 @@ namespace VictoryLauncher
         public Color Accent;
     }
 
+    static class UiTheme
+    {
+        public static readonly Color Bg = Color.FromArgb(12, 14, 19);
+        public static readonly Color Surface = Color.FromArgb(19, 22, 30);
+        public static readonly Color SurfaceHover = Color.FromArgb(26, 31, 42);
+        public static readonly Color SurfaceActive = Color.FromArgb(26, 35, 50);
+        public static readonly Color Border = Color.FromArgb(34, 41, 56);
+        public static readonly Color BorderHover = Color.FromArgb(58, 70, 95);
+        public static readonly Color Cyan = Color.FromArgb(34, 211, 238);
+        public static readonly Color Pink = Color.FromArgb(244, 63, 148);
+        public static readonly Color Green = Color.FromArgb(52, 211, 153);
+        public static readonly Color Amber = Color.FromArgb(251, 191, 36);
+        public static readonly Color Blurple = Color.FromArgb(114, 137, 218);
+        public static readonly Color Red = Color.FromArgb(248, 113, 113);
+        public static readonly Color Blue = Color.FromArgb(96, 165, 250);
+        public static readonly Color Slate = Color.FromArgb(148, 163, 184);
+        public static readonly Color Text = Color.FromArgb(241, 245, 249);
+        public static readonly Color Muted = Color.FromArgb(132, 146, 168);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        public static void ApplyDarkFrame(IntPtr hwnd)
+        {
+            try
+            {
+                int dark = 1;
+                DwmSetWindowAttribute(hwnd, 20, ref dark, sizeof(int));
+                int corner = 2;
+                DwmSetWindowAttribute(hwnd, 33, ref corner, sizeof(int));
+            }
+            catch { }
+        }
+
+        public static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            int d = Math.Max(2, radius * 2);
+            GraphicsPath path = new GraphicsPath();
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    sealed class DiscordConfigForm : Form
+    {
+        public string AppIdValue { get; private set; }
+        public bool HideTitleValue { get; private set; }
+
+        private readonly TextBox _tbId;
+        private readonly CheckBox _cbHide;
+
+        public DiscordConfigForm(string currentId, bool hideTitle)
+        {
+            AppIdValue = currentId ?? "";
+            HideTitleValue = hideTitle;
+
+            Text = "Discord Rich Presence";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = UiTheme.Bg;
+            ForeColor = UiTheme.Text;
+            ClientSize = new Size(420, 215);
+            Font = new Font("Segoe UI", 9f);
+
+            var lblTitle = new Label
+            {
+                Text = "DISCORD RICH PRESENCE (FLAMINGO)",
+                Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold),
+                ForeColor = UiTheme.Blurple,
+                Location = new Point(20, 16),
+                AutoSize = true
+            };
+
+            var lblHint = new Label
+            {
+                Text = "Cole o Application ID do Discord Developer Portal (somente dígitos):",
+                ForeColor = UiTheme.Muted,
+                Location = new Point(20, 42),
+                Size = new Size(380, 20)
+            };
+
+            _tbId = new TextBox
+            {
+                Text = AppIdValue,
+                BackColor = UiTheme.Surface,
+                ForeColor = UiTheme.Text,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 10.5f),
+                Location = new Point(20, 68),
+                Size = new Size(380, 26)
+            };
+
+            _cbHide = new CheckBox
+            {
+                Text = "Ocultar nome do jogo no status (mostrar apenas FPS e tempo)",
+                Checked = hideTitle,
+                ForeColor = UiTheme.Text,
+                BackColor = UiTheme.Bg,
+                Location = new Point(20, 106),
+                Size = new Size(380, 24)
+            };
+
+            var lblPortal = new LinkLabel
+            {
+                Text = "Abrir Discord Developer Portal",
+                LinkColor = UiTheme.Cyan,
+                ActiveLinkColor = UiTheme.Pink,
+                Location = new Point(20, 134),
+                AutoSize = true
+            };
+            lblPortal.LinkClicked += (s, e) =>
+            {
+                try { Process.Start("https://discord.com/developers/applications"); } catch { }
+            };
+
+            var btnCancel = new Button
+            {
+                Text = "Cancelar",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Surface,
+                ForeColor = UiTheme.Text,
+                Location = new Point(214, 166),
+                Size = new Size(88, 32),
+                DialogResult = DialogResult.Cancel
+            };
+            btnCancel.FlatAppearance.BorderColor = UiTheme.Border;
+
+            var btnSave = new Button
+            {
+                Text = "Salvar",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Blurple,
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold),
+                Location = new Point(310, 166),
+                Size = new Size(90, 32)
+            };
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.Click += (s, e) =>
+            {
+                string cleaned = _tbId.Text.Trim();
+                if (cleaned.Length > 0)
+                {
+                    foreach (char c in cleaned)
+                    {
+                        if (c < '0' || c > '9')
+                        {
+                            MessageBox.Show(this, "O Application ID deve conter apenas números.", "Discord RPC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
+                    }
+                }
+                AppIdValue = cleaned;
+                HideTitleValue = _cbHide.Checked;
+                DialogResult = DialogResult.OK;
+                Close();
+            };
+
+            Controls.AddRange(new Control[] { lblTitle, lblHint, _tbId, _cbHide, lblPortal, btnCancel, btnSave });
+            AcceptButton = btnSave;
+            CancelButton = btnCancel;
+            Shown += (s, e) => UiTheme.ApplyDarkFrame(Handle);
+        }
+    }
+
     sealed class KeymapForm : Form
     {
-        private static readonly Color BgWindow = Color.FromArgb(14, 16, 22);
-        private static readonly Color BgCard = Color.FromArgb(22, 26, 36);
-        private static readonly Color BgCardHover = Color.FromArgb(30, 36, 50);
-        private static readonly Color BorderSubtle = Color.FromArgb(38, 46, 64);
-        private static readonly Color AccentCyan = Color.FromArgb(34, 211, 238);
-        private static readonly Color AccentPink = Color.FromArgb(244, 63, 148);
-        private static readonly Color AccentGreen = Color.FromArgb(52, 211, 153);
-        private static readonly Color AccentAmber = Color.FromArgb(251, 191, 36);
-        private static readonly Color TextPrimary = Color.FromArgb(241, 245, 249);
-        private static readonly Color TextMuted = Color.FromArgb(148, 163, 184);
-
         private readonly List<KeyBindingItem> _items;
         private readonly float _scale;
         private Rectangle[] _rowRects;
@@ -53,12 +217,9 @@ namespace VictoryLauncher
         private Rectangle _cancelRect;
         private Rectangle _saveRect;
         private int _hoverRow = -1;
-        private int _hoverBtn = -1; // 0=Save, 1=Reset, 2=Cancel
+        private int _hoverBtn = -1;
         private int _listeningIndex = -1;
         private string _hint = "Clique em um botão do Xbox e pressione a tecla desejada (ESC cancela • DEL desativa).";
-
-        [DllImport("dwmapi.dll")]
-        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
         private int S(int v) { return (int)Math.Round(v * _scale); }
 
@@ -71,62 +232,40 @@ namespace VictoryLauncher
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
-            BackColor = BgWindow;
-            ForeColor = TextPrimary;
+            BackColor = UiTheme.Bg;
+            ForeColor = UiTheme.Text;
             DoubleBuffered = true;
             KeyPreview = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
 
             int rowsPerCol = (_items.Count + 1) / 2;
-            ClientSize = new Size(S(640), S(74) + rowsPerCol * S(32) + S(84));
+            ClientSize = new Size(S(620), S(72) + rowsPerCol * S(30) + S(80));
             ComputeLayout();
 
             MouseMove += OnMouseMoveCanvas;
             MouseDown += OnMouseDownCanvas;
             KeyDown += OnKeyDownCanvas;
-            Shown += (s, e) =>
-            {
-                try
-                {
-                    int dark = 1;
-                    DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
-                    int corner = 2;
-                    DwmSetWindowAttribute(Handle, 33, ref corner, sizeof(int));
-                }
-                catch { }
-            };
+            Shown += (s, e) => UiTheme.ApplyDarkFrame(Handle);
         }
 
         private void ComputeLayout()
         {
             _rowRects = new Rectangle[_items.Count];
-            int pad = S(20);
-            int gap = S(14);
+            int pad = S(18);
+            int gap = S(12);
             int colW = (ClientSize.Width - pad * 2 - gap) / 2;
             int rowsPerCol = (_items.Count + 1) / 2;
-            int startY = S(62);
+            int startY = S(58);
             for (int i = 0; i < _items.Count; i++)
             {
                 int col = i / rowsPerCol;
                 int row = i % rowsPerCol;
-                _rowRects[i] = new Rectangle(pad + col * (colW + gap), startY + row * S(32), colW, S(27));
+                _rowRects[i] = new Rectangle(pad + col * (colW + gap), startY + row * S(30), colW, S(25));
             }
-            int btnY = startY + rowsPerCol * S(32) + S(34);
-            _resetRect = new Rectangle(pad, btnY, S(162), S(34));
-            _cancelRect = new Rectangle(ClientSize.Width - pad - S(268), btnY, S(116), S(34));
-            _saveRect = new Rectangle(ClientSize.Width - pad - S(144), btnY, S(144), S(34));
-        }
-
-        private static GraphicsPath RoundedRect(Rectangle r, int radius)
-        {
-            int d = Math.Max(2, radius * 2);
-            GraphicsPath path = new GraphicsPath();
-            path.AddArc(r.X, r.Y, d, d, 180, 90);
-            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
+            int btnY = startY + rowsPerCol * S(30) + S(32);
+            _resetRect = new Rectangle(pad, btnY, S(150), S(32));
+            _cancelRect = new Rectangle(ClientSize.Width - pad - S(248), btnY, S(108), S(32));
+            _saveRect = new Rectangle(ClientSize.Width - pad - S(132), btnY, S(132), S(32));
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -135,22 +274,17 @@ namespace VictoryLauncher
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
-            using (var grad = new LinearGradientBrush(new Rectangle(0, 0, ClientSize.Width, S(3)), AccentPink, AccentCyan, 0f))
-            {
-                g.FillRectangle(grad, 0, 0, ClientSize.Width, S(3));
-            }
-
-            int pad = S(20);
-            using (var fTitle = new Font("Segoe UI Semibold", 12f, FontStyle.Bold))
+            int pad = S(18);
+            using (var fTitle = new Font("Segoe UI Semibold", 11f, FontStyle.Bold))
             using (var fSub = new Font("Segoe UI", 8.2f))
-            using (var fRow = new Font("Segoe UI", 8.6f))
-            using (var fKey = new Font("Segoe UI Semibold", 8.2f, FontStyle.Bold))
-            using (var bPri = new SolidBrush(TextPrimary))
-            using (var bMut = new SolidBrush(TextMuted))
+            using (var fRow = new Font("Segoe UI", 8.4f))
+            using (var fKey = new Font("Segoe UI Semibold", 8f, FontStyle.Bold))
+            using (var bPri = new SolidBrush(UiTheme.Text))
+            using (var bMut = new SolidBrush(UiTheme.Muted))
             using (var sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
             {
-                g.DrawString("MAPEAR CONTROLES DO XBOX PARA TECLADO", fTitle, bPri, pad, S(14));
-                g.DrawString("Ex.: clique em \"X (Azul)\" e pressione K para mapear X = K", fSub, bMut, pad, S(38));
+                g.DrawString("MAPEAMENTO XBOX → TECLADO", fTitle, bPri, pad, S(14));
+                g.DrawString("Clique em qualquer ação para redefinir a tecla", fSub, bMut, pad, S(36));
 
                 for (int i = 0; i < _items.Count; i++)
                 {
@@ -159,76 +293,68 @@ namespace VictoryLauncher
                     bool listening = (i == _listeningIndex);
                     bool hover = (i == _hoverRow);
 
-                    Color bg = listening ? Color.FromArgb(42, AccentPink) : (hover ? BgCardHover : BgCard);
-                    Color border = listening ? AccentPink : (hover ? AccentCyan : BorderSubtle);
-                    using (var p = RoundedRect(r, S(6)))
+                    Color bg = listening ? Color.FromArgb(40, UiTheme.Pink) : (hover ? UiTheme.SurfaceHover : UiTheme.Surface);
+                    Color border = listening ? UiTheme.Pink : (hover ? UiTheme.Cyan : UiTheme.Border);
+                    using (var p = UiTheme.RoundedRect(r, S(5)))
                     using (var bBg = new SolidBrush(bg))
-                    using (var pen = new Pen(border, listening ? 1.4f : 1f))
+                    using (var pen = new Pen(border, listening ? 1.3f : 1f))
                     {
                         g.FillPath(bBg, p);
                         g.DrawPath(pen, p);
                     }
-
-                    // Color dot for Xbox button
                     using (var bDot = new SolidBrush(item.Accent))
                     {
-                        g.FillEllipse(bDot, r.X + S(9), r.Y + S(9), S(8), S(8));
+                        g.FillEllipse(bDot, r.X + S(8), r.Y + S(8), S(7), S(7));
                     }
-                    g.DrawString(item.Label, fRow, bPri, r.X + S(24), r.Y + S(5));
+                    g.DrawString(item.Label, fRow, bPri, r.X + S(21), r.Y + S(4));
 
-                    // Key badge on right
-                    string keyText = listening ? "APERTE TECLA..." : (string.IsNullOrEmpty(item.Key) || item.Key == "NONE" ? "DESATIVADO" : item.Key);
+                    string keyText = listening ? "TECLA..." : (string.IsNullOrEmpty(item.Key) || item.Key == "NONE" ? "OFF" : item.Key);
                     bool modified = !string.Equals(item.Key, item.DefaultKey, StringComparison.OrdinalIgnoreCase);
-                    Color kColor = listening ? AccentPink : (modified ? AccentCyan : AccentGreen);
-                    Rectangle kr = new Rectangle(r.Right - S(104), r.Y + S(3), S(98), r.Height - S(6));
-                    using (var kp = RoundedRect(kr, S(5)))
-                    using (var bKBg = new SolidBrush(Color.FromArgb(30, kColor)))
-                    using (var pK = new Pen(Color.FromArgb(110, kColor), 1f))
+                    Color kColor = listening ? UiTheme.Pink : (modified ? UiTheme.Cyan : UiTheme.Green);
+                    Rectangle kr = new Rectangle(r.Right - S(94), r.Y + S(3), S(89), r.Height - S(6));
+                    using (var kp = UiTheme.RoundedRect(kr, S(4)))
+                    using (var bKBg = new SolidBrush(Color.FromArgb(28, kColor)))
                     using (var bKTxt = new SolidBrush(kColor))
                     {
                         g.FillPath(bKBg, kp);
-                        g.DrawPath(pK, kp);
                         g.DrawString(keyText, fKey, bKTxt, kr, sfC);
                     }
                 }
 
-                // Hint bar
                 int rowsPerCol = (_items.Count + 1) / 2;
-                int hintY = S(62) + rowsPerCol * S(32) + S(8);
-                using (var bHint = new SolidBrush(_listeningIndex >= 0 ? AccentPink : AccentAmber))
+                int hintY = S(58) + rowsPerCol * S(30) + S(8);
+                using (var bHint = new SolidBrush(_listeningIndex >= 0 ? UiTheme.Pink : UiTheme.Amber))
                 {
                     g.DrawString(_hint, fSub, bHint, pad, hintY);
                 }
 
                 DrawBtn(g, _resetRect, "Restaurar Padrão", false, _hoverBtn == 1, sfC);
                 DrawBtn(g, _cancelRect, "Cancelar", false, _hoverBtn == 2, sfC);
-                DrawBtn(g, _saveRect, "Salvar Controles", true, _hoverBtn == 0, sfC);
+                DrawBtn(g, _saveRect, "Salvar", true, _hoverBtn == 0, sfC);
             }
         }
 
         private void DrawBtn(Graphics g, Rectangle r, string text, bool primary, bool hover, StringFormat sf)
         {
-            using (var path = RoundedRect(r, S(8)))
+            using (var path = UiTheme.RoundedRect(r, S(7)))
             {
                 if (primary)
                 {
-                    using (var grad = new LinearGradientBrush(r, hover ? Color.FromArgb(255, 86, 164) : AccentPink, hover ? Color.FromArgb(56, 228, 250) : AccentCyan, 0f))
-                    {
+                    using (var grad = new LinearGradientBrush(r, UiTheme.Pink, UiTheme.Cyan, 0f))
                         g.FillPath(grad, path);
-                    }
                 }
                 else
                 {
-                    using (var bBg = new SolidBrush(hover ? BgCardHover : BgCard))
-                    using (var pen = new Pen(hover ? AccentCyan : BorderSubtle, 1f))
+                    using (var bBg = new SolidBrush(hover ? UiTheme.SurfaceHover : UiTheme.Surface))
+                    using (var pen = new Pen(hover ? UiTheme.BorderHover : UiTheme.Border, 1f))
                     {
                         g.FillPath(bBg, path);
                         g.DrawPath(pen, path);
                     }
                 }
             }
-            using (var f = new Font("Segoe UI Semibold", 8.8f, FontStyle.Bold))
-            using (var b = new SolidBrush(primary ? Color.FromArgb(10, 12, 18) : TextPrimary))
+            using (var f = new Font("Segoe UI Semibold", 8.6f, FontStyle.Bold))
+            using (var b = new SolidBrush(primary ? Color.FromArgb(10, 12, 18) : UiTheme.Text))
             {
                 g.DrawString(text, f, b, r, sf);
             }
@@ -236,14 +362,10 @@ namespace VictoryLauncher
 
         private void OnMouseMoveCanvas(object sender, MouseEventArgs e)
         {
-            int oldRow = _hoverRow;
-            int oldBtn = _hoverBtn;
-            _hoverRow = -1;
-            _hoverBtn = -1;
+            int oldRow = _hoverRow, oldBtn = _hoverBtn;
+            _hoverRow = -1; _hoverBtn = -1;
             for (int i = 0; i < _rowRects.Length; i++)
-            {
                 if (_rowRects[i].Contains(e.Location)) { _hoverRow = i; break; }
-            }
             if (_saveRect.Contains(e.Location)) _hoverBtn = 0;
             else if (_resetRect.Contains(e.Location)) _hoverBtn = 1;
             else if (_cancelRect.Contains(e.Location)) _hoverBtn = 2;
@@ -260,7 +382,7 @@ namespace VictoryLauncher
                 {
                     _listeningIndex = (_listeningIndex == i) ? -1 : i;
                     _hint = _listeningIndex >= 0
-                        ? "Aguardando tecla para \"" + _items[i].Label + "\"... (ESC cancela • DEL desativa)"
+                        ? "Pressione uma tecla para \"" + _items[i].Label + "\" (ESC cancela • DEL desativa)"
                         : "Clique em um botão do Xbox e pressione a tecla desejada.";
                     Invalidate();
                     return;
@@ -270,27 +392,18 @@ namespace VictoryLauncher
             {
                 _listeningIndex = -1;
                 foreach (var it in _items) it.Key = it.DefaultKey;
-                _hint = "Todos os botões restaurados para o padrão do Victory.";
+                _hint = "Padrões restaurados.";
                 Invalidate();
             }
-            else if (_cancelRect.Contains(e.Location))
-            {
-                DialogResult = DialogResult.Cancel;
-                Close();
-            }
-            else if (_saveRect.Contains(e.Location))
-            {
-                DialogResult = DialogResult.OK;
-                Close();
-            }
+            else if (_cancelRect.Contains(e.Location)) { DialogResult = DialogResult.Cancel; Close(); }
+            else if (_saveRect.Contains(e.Location)) { DialogResult = DialogResult.OK; Close(); }
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             if (_listeningIndex >= 0)
             {
-                Keys code = keyData & Keys.KeyCode;
-                HandleCapturedKey(code);
+                HandleCapturedKey(keyData & Keys.KeyCode);
                 return true;
             }
             return base.ProcessCmdKey(ref msg, keyData);
@@ -298,59 +411,24 @@ namespace VictoryLauncher
 
         private void OnKeyDownCanvas(object sender, KeyEventArgs e)
         {
-            if (_listeningIndex >= 0)
-            {
-                HandleCapturedKey(e.KeyCode);
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-                return;
-            }
-            if (e.KeyCode == Keys.Escape)
-            {
-                DialogResult = DialogResult.Cancel;
-                Close();
-            }
+            if (_listeningIndex >= 0) { HandleCapturedKey(e.KeyCode); e.Handled = true; e.SuppressKeyPress = true; return; }
+            if (e.KeyCode == Keys.Escape) { DialogResult = DialogResult.Cancel; Close(); }
         }
 
         private void HandleCapturedKey(Keys code)
         {
             if (_listeningIndex < 0) return;
-            if (code == Keys.Escape)
-            {
-                _listeningIndex = -1;
-                _hint = "Captura cancelada.";
-                Invalidate();
-                return;
-            }
-            string mapped = KeyToSpec(code);
-            if (code == Keys.Delete)
-            {
-                mapped = "NONE";
-            }
-            if (string.IsNullOrEmpty(mapped))
-            {
-                _hint = "Tecla não suportada (" + code + "). Tente outra tecla.";
-                Invalidate();
-                return;
-            }
+            if (code == Keys.Escape) { _listeningIndex = -1; _hint = "Cancelado."; Invalidate(); return; }
+            string mapped = code == Keys.Delete ? "NONE" : KeyToSpec(code);
+            if (string.IsNullOrEmpty(mapped)) { _hint = "Tecla não suportada."; Invalidate(); return; }
             var target = _items[_listeningIndex];
-            string cleared = null;
             if (mapped != "NONE")
-            {
                 foreach (var other in _items)
-                {
                     if (other != target && string.Equals(other.Key, mapped, StringComparison.OrdinalIgnoreCase))
-                    {
                         other.Key = "NONE";
-                        cleared = other.Label;
-                    }
-                }
-            }
             target.Key = mapped;
             _listeningIndex = -1;
-            _hint = mapped == "NONE"
-                ? "\"" + target.Label + "\" desativado."
-                : ("Mapeado: " + target.Label + " = " + mapped + (cleared != null ? " (removido de \"" + cleared + "\")" : ""));
+            _hint = target.Label + " = " + mapped;
             Invalidate();
         }
 
@@ -366,15 +444,9 @@ namespace VictoryLauncher
                 case Keys.Return: return "ENTER";
                 case Keys.Tab: return "TAB";
                 case Keys.Back: return "BACKSPACE";
-                case Keys.ShiftKey:
-                case Keys.LShiftKey:
-                case Keys.RShiftKey: return "SHIFT";
-                case Keys.ControlKey:
-                case Keys.LControlKey:
-                case Keys.RControlKey: return "CTRL";
-                case Keys.Menu:
-                case Keys.LMenu:
-                case Keys.RMenu: return "ALT";
+                case Keys.ShiftKey: case Keys.LShiftKey: case Keys.RShiftKey: return "SHIFT";
+                case Keys.ControlKey: case Keys.LControlKey: case Keys.RControlKey: return "CTRL";
+                case Keys.Menu: case Keys.LMenu: case Keys.RMenu: return "ALT";
                 case Keys.CapsLock: return "CAPSLOCK";
                 case Keys.Up: return "UP";
                 case Keys.Down: return "DOWN";
@@ -385,180 +457,350 @@ namespace VictoryLauncher
                 case Keys.End: return "END";
                 case Keys.PageUp: return "PGUP";
                 case Keys.PageDown: return "PGDN";
-                case Keys.Oemcomma: return "COMMA";
-                case Keys.OemPeriod: return "PERIOD";
-                case Keys.OemSemicolon: return "SEMICOLON";
-                case Keys.OemQuestion: return "SLASH";
-                case Keys.OemMinus: return "MINUS";
-                case Keys.Oemplus: return "EQUALS";
-                case Keys.OemOpenBrackets: return "LBRACKET";
-                case Keys.OemCloseBrackets: return "RBRACKET";
-                case Keys.OemPipe: return "BACKSLASH";
-                case Keys.OemQuotes: return "QUOTE";
-                case Keys.Oemtilde: return "TILDE";
                 default:
                     int vk = (int)code;
-                    if (vk >= 8 && vk <= 254) return "0x" + vk.ToString("X2");
-                    return null;
+                    return (vk >= 8 && vk <= 254) ? ("0x" + vk.ToString("X2")) : null;
             }
+        }
+    }
+
+    sealed class ControlsForm : Form
+    {
+        public bool MouseCamera { get; private set; }
+        public bool MouseInvertY { get; private set; }
+        public float MouseSens { get; private set; }
+        public string MouseButtonsMode { get; private set; }
+        private readonly List<KeyBindingItem> _keymap;
+        private readonly float _scale;
+
+        private readonly CheckBox _cbCam;
+        private readonly CheckBox _cbInv;
+        private readonly TrackBar _tbSens;
+        private readonly Label _lblSensVal;
+        private readonly ComboBox _cmbBtns;
+
+        public ControlsForm(bool cam, bool inv, float sens, string btns, List<KeyBindingItem> keymap, float scale)
+        {
+            MouseCamera = cam;
+            MouseInvertY = inv;
+            MouseSens = sens;
+            MouseButtonsMode = btns;
+            _keymap = keymap;
+            _scale = scale;
+
+            Text = "Controles — Mouse & Teclado";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = UiTheme.Bg;
+            ForeColor = UiTheme.Text;
+            ClientSize = new Size(420, 260);
+            Font = new Font("Segoe UI", 9f);
+
+            var lblHdr = new Label
+            {
+                Text = "MOUSE E MAPEAMENTO XBOX → TECLADO",
+                Font = new Font("Segoe UI Semibold", 9.2f, FontStyle.Bold),
+                ForeColor = UiTheme.Cyan,
+                Location = new Point(20, 16),
+                AutoSize = true
+            };
+
+            _cbCam = new CheckBox
+            {
+                Text = "Mouse como Câmera (Analógico Direito • F9 trava/solta)",
+                Checked = cam,
+                ForeColor = UiTheme.Text,
+                Location = new Point(20, 46),
+                Size = new Size(380, 24)
+            };
+
+            _cbInv = new CheckBox
+            {
+                Text = "Inverter Eixo Y",
+                Checked = inv,
+                ForeColor = UiTheme.Muted,
+                Location = new Point(20, 72),
+                Size = new Size(160, 24)
+            };
+
+            var lblSens = new Label { Text = "Sensibilidade:", ForeColor = UiTheme.Muted, Location = new Point(20, 108), AutoSize = true };
+            _lblSensVal = new Label { Text = sens.ToString("0.0", CultureInfo.InvariantCulture) + "x", ForeColor = UiTheme.Cyan, Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold), Location = new Point(358, 108), AutoSize = true };
+            _tbSens = new TrackBar
+            {
+                Minimum = 2,
+                Maximum = 40,
+                Value = Math.Max(2, Math.Min(40, (int)Math.Round(sens * 10))),
+                TickStyle = TickStyle.None,
+                BackColor = UiTheme.Bg,
+                Location = new Point(112, 102),
+                Size = new Size(238, 30)
+            };
+            _tbSens.ValueChanged += (s, e) =>
+            {
+                _lblSensVal.Text = (_tbSens.Value / 10f).ToString("0.0", CultureInfo.InvariantCulture) + "x";
+            };
+
+            var lblBtns = new Label { Text = "Botões Mouse:", ForeColor = UiTheme.Muted, Location = new Point(20, 146), AutoSize = true };
+            _cmbBtns = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = UiTheme.Surface,
+                ForeColor = UiTheme.Text,
+                FlatStyle = FlatStyle.Flat,
+                Location = new Point(118, 142),
+                Size = new Size(282, 24)
+            };
+            _cmbBtns.Items.AddRange(new object[] { "Dir: Atirar | Esq: Mirar", "Esq: Atirar | Dir: Mirar", "Desativado" });
+            _cmbBtns.SelectedIndex = btns == "lmb_shoot" ? 1 : (btns == "off" ? 2 : 0);
+
+            var btnKeymap = new Button
+            {
+                Text = "Mapear Botões Xbox → Teclado...",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Surface,
+                ForeColor = UiTheme.Cyan,
+                Location = new Point(20, 180),
+                Size = new Size(380, 30)
+            };
+            btnKeymap.FlatAppearance.BorderColor = UiTheme.Border;
+            btnKeymap.Click += (s, e) =>
+            {
+                var copy = new List<KeyBindingItem>(_keymap.Count);
+                foreach (var it in _keymap)
+                    copy.Add(new KeyBindingItem { Id = it.Id, Label = it.Label, DefaultKey = it.DefaultKey, Key = it.Key, Accent = it.Accent });
+                using (var dlg = new KeymapForm(copy, _scale))
+                {
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        for (int i = 0; i < _keymap.Count; i++) _keymap[i].Key = copy[i].Key;
+                    }
+                }
+            };
+
+            var btnCancel = new Button
+            {
+                Text = "Cancelar",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Surface,
+                ForeColor = UiTheme.Text,
+                Location = new Point(214, 218),
+                Size = new Size(88, 30),
+                DialogResult = DialogResult.Cancel
+            };
+            btnCancel.FlatAppearance.BorderColor = UiTheme.Border;
+
+            var btnSave = new Button
+            {
+                Text = "Aplicar",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = UiTheme.Cyan,
+                ForeColor = Color.FromArgb(10, 12, 18),
+                Font = new Font("Segoe UI Semibold", 9f, FontStyle.Bold),
+                Location = new Point(310, 218),
+                Size = new Size(90, 30)
+            };
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.Click += (s, e) =>
+            {
+                MouseCamera = _cbCam.Checked;
+                MouseInvertY = _cbInv.Checked;
+                MouseSens = _tbSens.Value / 10f;
+                MouseButtonsMode = _cmbBtns.SelectedIndex == 1 ? "lmb_shoot" : (_cmbBtns.SelectedIndex == 2 ? "off" : "rmb_shoot");
+                DialogResult = DialogResult.OK;
+                Close();
+            };
+
+            Controls.AddRange(new Control[] { lblHdr, _cbCam, _cbInv, lblSens, _tbSens, _lblSensVal, lblBtns, _cmbBtns, btnKeymap, btnCancel, btnSave });
+            AcceptButton = btnSave;
+            CancelButton = btnCancel;
+            Shown += (s, e) => UiTheme.ApplyDarkFrame(Handle);
         }
     }
 
     sealed class LauncherForm : Form
     {
-        private const string GameDir = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK";
         private const string RepoDir = @"C:\Users\gabri\Downloads\victory-klbf-lab39";
+        private const string BackupsDir = @"C:\Users\gabri\Downloads\victory-backups";
         private const string DataDir = @"C:\Users\gabri\Downloads\victory-data";
         private const string ConfigPath = @"C:\Users\gabri\Downloads\victory-data\launcher-config.ini";
+        private const string DiscordIdPath = @"C:\Users\gabri\Downloads\victory-data\discord_app_id.txt";
         private const string Ps1Path = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-klbf-lab39.ps1";
-        private const string GLeafPs1Path = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-gleaf-ka1qux.ps1";
-        private const string GLeafExePath = @"C:\Users\gabri\Downloads\victory-gleaf6\target\release\victory.exe";
         private const string PrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-KLBF-Lab39-AMD.bat";
-        private const string GLeafPrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-GLeaf-Ka1qux-AMD.bat";
 
-        private static readonly Color BgWindow = Color.FromArgb(14, 16, 22);
-        private static readonly Color BgCard = Color.FromArgb(22, 26, 36);
-        private static readonly Color BgCardHover = Color.FromArgb(28, 34, 47);
-        private static readonly Color BgCardSelected = Color.FromArgb(30, 38, 54);
-        private static readonly Color BgPanel = Color.FromArgb(18, 22, 31);
-        private static readonly Color BorderSubtle = Color.FromArgb(38, 46, 64);
-        private static readonly Color AccentCyan = Color.FromArgb(34, 211, 238);
-        private static readonly Color AccentPink = Color.FromArgb(244, 63, 148);
-        private static readonly Color AccentGreen = Color.FromArgb(52, 211, 153);
-        private static readonly Color AccentAmber = Color.FromArgb(251, 191, 36);
-        private static readonly Color AccentBlue = Color.FromArgb(96, 165, 250);
-        private static readonly Color AccentRed = Color.FromArgb(248, 113, 113);
-        private static readonly Color AccentSlate = Color.FromArgb(148, 163, 184);
-        private static readonly Color TextPrimary = Color.FromArgb(241, 245, 249);
-        private static readonly Color TextMuted = Color.FromArgb(148, 163, 184);
-
-        private readonly List<GameVersion> _versions = new List<GameVersion>();
+        private readonly List<BuildEntry> _builds = new List<BuildEntry>();
+        private readonly List<PresetEntry> _presets = new List<PresetEntry>();
         private readonly List<KeyBindingItem> _keymap = new List<KeyBindingItem>();
-        private int _selectedIndex = 0;
-        private int _hoverIndex = -1;
-        // 0=Play, 1=Precompile, 2=Logs, 3=HudChk, 4=CloseChk, 5=MouseCamChk, 6=InvertYChk,
-        // 7=SensTrack, 8=BtnRmbShoot, 9=BtnLmbShoot, 10=BtnOff, 11=UnifiedMemChk, 12=KeymapBtn
+
+        private int _selectedBuild = 0;
+        private int _selectedPreset = 0;
+        private int _hoverBuild = -1;
+        private int _hoverPreset = -1;
+        // 0=Play, 1=Controls, 2=Shaders, 3=Logs, 4=DiscordCfg,
+        // 10=Unified, 11=Boost, 12=Lite, 13=Hud, 14=Discord, 15=Close
         private int _hoverCtrl = -1;
-        private bool _draggingSens = false;
 
         private bool _enableHud = true;
         private bool _closeOnLaunch = true;
         private bool _unifiedMemory = true;
         private bool _liteGraphics = false;
+        private bool _cpuGpuBoost = false;
+        private bool _discordRpc = false;
+        private bool _discordHideTitle = false;
+        private string _discordAppId = "";
         private bool _mouseCamera = false;
         private bool _mouseInvertY = false;
-        private float _mouseSens = 1.0f; // 0.2 .. 4.0
-        private string _mouseButtons = "rmb_shoot"; // "rmb_shoot", "lmb_shoot", "off"
-        private bool _cachePrecompiled = false;
-        private string _statusText = "";
+        private float _mouseSens = 1.0f;
+        private string _mouseButtons = "rmb_shoot";
+        private bool _cacheOk = false;
+        private string _status = "";
         private float _scale = 1f;
 
-        private int S(int v) { return (int)Math.Round(v * _scale); }
-
-        private Rectangle[] _cardRects = new Rectangle[0];
-        private Rectangle _mousePanelRect;
-        private Rectangle _mouseCamChkRect;
-        private Rectangle _invertYChkRect;
-        private Rectangle _sensTrackRect;
-        private Rectangle _btnRmbRect;
-        private Rectangle _btnLmbRect;
-        private Rectangle _btnOffRect;
-        private Rectangle _keymapBtnRect;
-        private Rectangle _unifiedChkRect;
-        private Rectangle _liteChkRect;
-        private Rectangle _hudChkRect;
-        private Rectangle _closeChkRect;
-        private Rectangle _precompileRect;
-        private Rectangle _logsRect;
-        private Rectangle _playRect;
-
-        [DllImport("dwmapi.dll")]
-        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+        private Rectangle[] _buildRects = new Rectangle[0];
+        private Rectangle[] _presetRects = new Rectangle[0];
+        private Rectangle _chkUnified, _chkBoost, _chkLite, _chkHud, _chkDiscord, _btnDiscordCfg, _chkClose;
+        private Rectangle _btnControls, _btnShaders, _btnLogs, _btnPlay;
 
         [DllImport("kernel32.dll")]
         private static extern bool SetProcessWorkingSetSize(IntPtr proc, IntPtr min, IntPtr max);
-
         [DllImport("psapi.dll")]
         private static extern bool EmptyWorkingSet(IntPtr hProcess);
-
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
+        private int S(int v) { return (int)Math.Round(v * _scale); }
+
         public LauncherForm()
         {
-            Text = "GTA VI — VIctory Launcher";
+            Text = "GTA VI — VIctory";
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
-            BackColor = BgWindow;
-            ForeColor = TextPrimary;
+            BackColor = UiTheme.Bg;
+            ForeColor = UiTheme.Text;
             DoubleBuffered = true;
             KeyPreview = true;
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
 
             using (var g = CreateGraphics()) { _scale = g.DpiX / 96f; }
-            _cachePrecompiled = File.Exists(Path.Combine(DataDir, "cache-klbf-lab39", "precompiled.ok"));
+            _cacheOk = File.Exists(Path.Combine(DataDir, "cache-klbf-lab39", "precompiled.ok"));
+
             InitDefaultKeymap();
-            LoadVersions();
+            DiscoverBuilds();
+            InitPresets();
             LoadConfig();
 
-            int listH = _versions.Count * S(54) + (_versions.Count - 1) * S(6);
-            ClientSize = new Size(S(680), S(104) + listH + S(178) + S(140));
+            ClientSize = new Size(S(560), S(548));
             ComputeLayout();
 
             MouseMove += OnMouseMoveCanvas;
-            MouseLeave += (s, e) => { if (!_draggingSens) { _hoverIndex = -1; _hoverCtrl = -1; Cursor = Cursors.Default; Invalidate(); } };
+            MouseLeave += (s, e) => { _hoverBuild = -1; _hoverPreset = -1; _hoverCtrl = -1; Cursor = Cursors.Default; Invalidate(); };
             MouseDown += OnMouseDownCanvas;
-            MouseUp += (s, e) => { if (_draggingSens) { _draggingSens = false; SaveConfig(); Invalidate(); } };
             MouseDoubleClick += OnMouseDoubleClickCanvas;
             KeyDown += OnKeyDownCanvas;
-            Shown += (s, e) => { EnableDarkTitleBar(); TrimMemory(); };
+            Shown += (s, e) => { UiTheme.ApplyDarkFrame(Handle); TrimMemory(); };
+        }
+
+        private void DiscoverBuilds()
+        {
+            _builds.Clear();
+            string liveExe = Path.Combine(RepoDir, "target", "release", "victory.exe");
+            if (File.Exists(liveExe))
+            {
+                _builds.Add(new BuildEntry
+                {
+                    Name = "Atual",
+                    Meta = "build local",
+                    ExePath = liveExe,
+                    IsLatest = true
+                });
+            }
+
+            if (Directory.Exists(BackupsDir))
+            {
+                string[] dirs = Directory.GetDirectories(BackupsDir, "motor1-v*");
+                Array.Sort(dirs, StringComparer.OrdinalIgnoreCase);
+                Array.Reverse(dirs); // newest version first (v1.2.0, v1.1.0-rc1, v1.0.0)
+                foreach (string dir in dirs)
+                {
+                    string exe = Path.Combine(dir, "victory.exe");
+                    if (!File.Exists(exe)) continue;
+                    string folder = Path.GetFileName(dir);
+                    string ver = folder.StartsWith("motor1-", StringComparison.OrdinalIgnoreCase)
+                        ? folder.Substring("motor1-".Length)
+                        : folder;
+                    string meta = "";
+                    string vf = Path.Combine(dir, "VERSION.txt");
+                    if (File.Exists(vf))
+                    {
+                        try
+                        {
+                            foreach (string ln in File.ReadAllLines(vf))
+                            {
+                                if (ln.StartsWith("commit=", StringComparison.OrdinalIgnoreCase))
+                                    meta = ln.Substring(7).Trim();
+                            }
+                        }
+                        catch { }
+                    }
+                    _builds.Add(new BuildEntry { Name = ver, Meta = meta, ExePath = exe, IsLatest = false });
+                }
+            }
+
+            if (_builds.Count == 0)
+            {
+                _builds.Add(new BuildEntry { Name = "Sem Build", Meta = "compile --release", ExePath = "", IsLatest = false });
+            }
+        }
+
+        private void InitPresets()
+        {
+            _presets.Clear();
+            _presets.Add(new PresetEntry { Title = "FSR 2.4 + FrameGen", Subtitle = "720p • Maior fluidez na RX 6600", Tag = "RECOMENDADO", TagColor = UiTheme.Green, Args = "-FrameGen -Res720p" });
+            _presets.Add(new PresetEntry { Title = "FSR 2.4", Subtitle = "720p • Sem geração de quadros", Tag = "720p", TagColor = UiTheme.Cyan, Args = "-Res720p" });
+            _presets.Add(new PresetEntry { Title = "Simple Ultraleve", Subtitle = "720p • Menor consumo de RAM e VRAM", Tag = "LEVE", TagColor = UiTheme.Blue, Args = "-SimpleUpscale -Res720p" });
+            _presets.Add(new PresetEntry { Title = "FSR 2.4 Full HD", Subtitle = "1080p • Resolução nativa", Tag = "1080p", TagColor = UiTheme.Slate, Args = "" });
+            _presets.Add(new PresetEntry { Title = "Modo Seguro", Subtitle = "720p • Flags conservadoras", Tag = "SAFE", TagColor = UiTheme.Amber, Args = "-Safe -Res720p" });
         }
 
         private void InitDefaultKeymap()
         {
             _keymap.Clear();
             Action<string, string, string, Color> add = (id, label, def, col) =>
-            {
                 _keymap.Add(new KeyBindingItem { Id = id, Label = label, DefaultKey = def, Key = def, Accent = col });
-            };
-            add("A", "Botão A (Verde)", "ENTER", AccentGreen);
-            add("B", "Botão B (Vermelho)", "BACKSPACE", AccentRed);
-            add("X", "Botão X (Azul)", "X", AccentBlue);
-            add("Y", "Botão Y (Amarelo)", "Y", AccentAmber);
-            add("LB", "LB / L1 (Ombro Esq)", "Q", AccentCyan);
-            add("RB", "RB / R1 (Ombro Dir)", "E", AccentCyan);
-            add("LT", "LT / L2 (Gatilho Esq)", "Z", AccentPink);
-            add("RT", "RT / R2 (Gatilho Dir)", "C", AccentPink);
-            add("MENU", "Start / Menu", "ESC", AccentSlate);
-            add("VIEW", "Back / View", "TAB", AccentSlate);
-            add("LS", "L3 (Analógico Esq)", "F", AccentSlate);
-            add("RS", "R3 (Analógico Dir)", "H", AccentSlate);
-
-            add("UP", "D-Pad Cima", "UP", AccentCyan);
-            add("DOWN", "D-Pad Baixo", "DOWN", AccentCyan);
-            add("LEFT", "D-Pad Esquerda", "LEFT", AccentCyan);
-            add("RIGHT", "D-Pad Direita", "RIGHT", AccentCyan);
-            add("LY+", "Mover Frente (LS ↑)", "W", AccentGreen);
-            add("LY-", "Mover Trás (LS ↓)", "S", AccentGreen);
-            add("LX-", "Mover Esquerda (LS ←)", "A", AccentGreen);
-            add("LX+", "Mover Direita (LS →)", "D", AccentGreen);
-            add("RY+", "Câmera Cima (RS ↑)", "I", AccentAmber);
-            add("RY-", "Câmera Baixo (RS ↓)", "K", AccentAmber);
-            add("RX-", "Câmera Esquerda (RS ←)", "J", AccentAmber);
-            add("RX+", "Câmera Direita (RS →)", "L", AccentAmber);
+            add("A", "Botão A", "ENTER", UiTheme.Green);
+            add("B", "Botão B", "BACKSPACE", UiTheme.Red);
+            add("X", "Botão X", "X", UiTheme.Blue);
+            add("Y", "Botão Y", "Y", UiTheme.Amber);
+            add("LB", "LB / L1", "Q", UiTheme.Cyan);
+            add("RB", "RB / R1", "E", UiTheme.Cyan);
+            add("LT", "LT / L2", "Z", UiTheme.Pink);
+            add("RT", "RT / R2", "C", UiTheme.Pink);
+            add("MENU", "Start / Menu", "ESC", UiTheme.Slate);
+            add("VIEW", "Back / View", "TAB", UiTheme.Slate);
+            add("LS", "L3", "F", UiTheme.Slate);
+            add("RS", "R3", "H", UiTheme.Slate);
+            add("UP", "D-Pad Cima", "UP", UiTheme.Cyan);
+            add("DOWN", "D-Pad Baixo", "DOWN", UiTheme.Cyan);
+            add("LEFT", "D-Pad Esq", "LEFT", UiTheme.Cyan);
+            add("RIGHT", "D-Pad Dir", "RIGHT", UiTheme.Cyan);
+            add("LY+", "Frente (LS ↑)", "W", UiTheme.Green);
+            add("LY-", "Trás (LS ↓)", "S", UiTheme.Green);
+            add("LX-", "Esq (LS ←)", "A", UiTheme.Green);
+            add("LX+", "Dir (LS →)", "D", UiTheme.Green);
+            add("RY+", "Câmera ↑", "I", UiTheme.Amber);
+            add("RY-", "Câmera ↓", "K", UiTheme.Amber);
+            add("RX-", "Câmera ←", "J", UiTheme.Amber);
+            add("RX+", "Câmera →", "L", UiTheme.Amber);
         }
 
         private string SerializeCustomKeymap()
         {
             var diffs = new List<string>();
             foreach (var it in _keymap)
-            {
                 if (!string.Equals(it.Key, it.DefaultKey, StringComparison.OrdinalIgnoreCase))
-                {
                     diffs.Add(it.Id + "=" + (string.IsNullOrEmpty(it.Key) ? "NONE" : it.Key));
-                }
-            }
             return string.Join(",", diffs.ToArray());
         }
 
@@ -572,26 +814,533 @@ namespace VictoryLauncher
                 string id = pair.Substring(0, eq).Trim();
                 string val = pair.Substring(eq + 1).Trim().ToUpperInvariant();
                 foreach (var it in _keymap)
+                    if (string.Equals(it.Id, id, StringComparison.OrdinalIgnoreCase)) { it.Key = val; break; }
+            }
+        }
+
+        private void LoadConfig()
+        {
+            try
+            {
+                if (File.Exists(DiscordIdPath))
+                    _discordAppId = File.ReadAllText(DiscordIdPath).Trim();
+            }
+            catch { }
+
+            try
+            {
+                if (!File.Exists(ConfigPath)) return;
+                foreach (string raw in File.ReadAllLines(ConfigPath))
                 {
-                    if (string.Equals(it.Id, id, StringComparison.OrdinalIgnoreCase))
+                    int eq = raw.IndexOf('=');
+                    if (eq <= 0) continue;
+                    string k = raw.Substring(0, eq).Trim();
+                    string v = raw.Substring(eq + 1).Trim();
+                    if (k == "preset")
                     {
-                        it.Key = val;
-                        break;
+                        int idx;
+                        if (int.TryParse(v, out idx) && idx >= 0 && idx < _presets.Count) _selectedPreset = idx;
                     }
+                    else if (k == "build_version")
+                    {
+                        for (int i = 0; i < _builds.Count; i++)
+                            if (string.Equals(_builds[i].Name, v, StringComparison.OrdinalIgnoreCase)) { _selectedBuild = i; break; }
+                    }
+                    else if (k == "hud") _enableHud = (v == "1");
+                    else if (k == "close_on_launch") _closeOnLaunch = (v == "1");
+                    else if (k == "unified_memory") _unifiedMemory = (v != "0");
+                    else if (k == "lite_graphics") _liteGraphics = (v == "1");
+                    else if (k == "cpu_gpu_boost") _cpuGpuBoost = (v == "1");
+                    else if (k == "discord_rpc") _discordRpc = (v == "1");
+                    else if (k == "discord_hide_title") _discordHideTitle = (v == "1");
+                    else if (k == "mouse_camera") _mouseCamera = (v == "1");
+                    else if (k == "mouse_invert_y") _mouseInvertY = (v == "1");
+                    else if (k == "mouse_sens")
+                    {
+                        float s;
+                        if (float.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out s))
+                            _mouseSens = Math.Max(0.2f, Math.Min(4.0f, s));
+                    }
+                    else if (k == "mouse_buttons" && (v == "rmb_shoot" || v == "lmb_shoot" || v == "off")) _mouseButtons = v;
+                    else if (k == "keymap") ApplyKeymapString(v);
+                }
+            }
+            catch { }
+        }
+
+        private void SaveConfig()
+        {
+            try
+            {
+                Directory.CreateDirectory(DataDir);
+                string buildName = (_selectedBuild >= 0 && _selectedBuild < _builds.Count) ? _builds[_selectedBuild].Name : "Atual";
+                File.WriteAllLines(ConfigPath, new[]
+                {
+                    "preset=" + _selectedPreset,
+                    "build_version=" + buildName,
+                    "hud=" + (_enableHud ? "1" : "0"),
+                    "close_on_launch=" + (_closeOnLaunch ? "1" : "0"),
+                    "unified_memory=" + (_unifiedMemory ? "1" : "0"),
+                    "lite_graphics=" + (_liteGraphics ? "1" : "0"),
+                    "cpu_gpu_boost=" + (_cpuGpuBoost ? "1" : "0"),
+                    "discord_rpc=" + (_discordRpc ? "1" : "0"),
+                    "discord_hide_title=" + (_discordHideTitle ? "1" : "0"),
+                    "mouse_camera=" + (_mouseCamera ? "1" : "0"),
+                    "mouse_invert_y=" + (_mouseInvertY ? "1" : "0"),
+                    "mouse_sens=" + _mouseSens.ToString("0.00", CultureInfo.InvariantCulture),
+                    "mouse_buttons=" + _mouseButtons,
+                    "keymap=" + SerializeCustomKeymap()
+                });
+                if (!string.IsNullOrEmpty(_discordAppId))
+                    File.WriteAllText(DiscordIdPath, _discordAppId);
+                else if (File.Exists(DiscordIdPath))
+                    File.Delete(DiscordIdPath);
+            }
+            catch { }
+        }
+
+        private void ComputeLayout()
+        {
+            int pad = S(22);
+            int w = ClientSize.Width - pad * 2;
+
+            // Version selector row (up to 4 visible pills)
+            int visibleBuilds = Math.Min(_builds.Count, 5);
+            _buildRects = new Rectangle[visibleBuilds];
+            int bGap = S(6);
+            int bW = (w - bGap * (visibleBuilds - 1)) / Math.Max(1, visibleBuilds);
+            int bY = S(84);
+            for (int i = 0; i < visibleBuilds; i++)
+                _buildRects[i] = new Rectangle(pad + i * (bW + bGap), bY, bW, S(34));
+
+            // Preset rows (5 clean minimalist cards)
+            _presetRects = new Rectangle[_presets.Count];
+            int pY = bY + S(56);
+            for (int i = 0; i < _presets.Count; i++)
+            {
+                _presetRects[i] = new Rectangle(pad, pY, w, S(42));
+                pY += S(47);
+            }
+
+            // 2-column compact options grid
+            int optY = pY + S(12);
+            int colW = (w - S(12)) / 2;
+            int col2X = pad + colW + S(12);
+            _chkUnified = new Rectangle(pad, optY, colW, S(24));
+            _chkBoost = new Rectangle(col2X, optY, colW, S(24));
+
+            _chkLite = new Rectangle(pad, optY + S(27), colW, S(24));
+            _chkHud = new Rectangle(col2X, optY + S(27), colW, S(24));
+
+            _chkDiscord = new Rectangle(pad, optY + S(54), colW - S(62), S(24));
+            _btnDiscordCfg = new Rectangle(pad + colW - S(58), optY + S(55), S(56), S(22));
+            _chkClose = new Rectangle(col2X, optY + S(54), colW, S(24));
+
+            // Bottom action bar
+            int btnY = optY + S(92);
+            _btnControls = new Rectangle(pad, btnY, S(104), S(38));
+            _btnShaders = new Rectangle(pad + S(110), btnY, S(84), S(38));
+            _btnLogs = new Rectangle(pad + S(200), btnY, S(68), S(38));
+            _btnPlay = new Rectangle(ClientSize.Width - pad - S(224), btnY, S(224), S(38));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            // Subtle 2px top accent bar
+            using (var grad = new LinearGradientBrush(new Rectangle(0, 0, ClientSize.Width, S(2)), UiTheme.Pink, UiTheme.Cyan, 0f))
+                g.FillRectangle(grad, 0, 0, ClientSize.Width, S(2));
+
+            int pad = S(22);
+            using (var fTitle = new Font("Segoe UI Semibold", 15f, FontStyle.Bold))
+            using (var fSub = new Font("Segoe UI", 8.2f))
+            using (var fSec = new Font("Segoe UI Semibold", 7.2f, FontStyle.Bold))
+            using (var fItem = new Font("Segoe UI Semibold", 9.2f, FontStyle.Bold))
+            using (var fItemSub = new Font("Segoe UI", 7.9f))
+            using (var fPill = new Font("Segoe UI Semibold", 7.2f, FontStyle.Bold))
+            using (var bTxt = new SolidBrush(UiTheme.Text))
+            using (var bMut = new SolidBrush(UiTheme.Muted))
+            using (var sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                // Minimalist Header
+                g.DrawString("GTA VI", fTitle, bTxt, pad, S(14));
+                float wGta = g.MeasureString("GTA VI", fTitle).Width;
+                using (var bCyan = new SolidBrush(UiTheme.Cyan))
+                    g.DrawString("VICTORY", fTitle, bCyan, pad + wGta - S(2), S(14));
+
+                g.DrawString("RX 6600 8 GB  •  Ryzen 5 4500  •  Motor 1", fSub, bMut, pad, S(42));
+
+                // Cache status pill
+                string cTxt = _cacheOk ? "SHADERS OK" : "CACHE FRIO";
+                Color cCol = _cacheOk ? UiTheme.Green : UiTheme.Amber;
+                int cW = (int)g.MeasureString(cTxt, fPill).Width + S(18);
+                Rectangle cRect = new Rectangle(ClientSize.Width - pad - cW, S(20), cW, S(21));
+                using (var p = UiTheme.RoundedRect(cRect, S(10)))
+                using (var b = new SolidBrush(Color.FromArgb(24, cCol)))
+                using (var pen = new Pen(Color.FromArgb(90, cCol), 1f))
+                using (var bt = new SolidBrush(cCol))
+                {
+                    g.FillPath(b, p);
+                    g.DrawPath(pen, p);
+                    g.DrawString(cTxt, fPill, bt, cRect, sfC);
+                }
+
+                // Section 1: Version selector
+                g.DrawString("VERSÃO DO MOTOR", fSec, bMut, pad, S(68));
+                for (int i = 0; i < _buildRects.Length; i++)
+                {
+                    BuildEntry b = _builds[i];
+                    Rectangle r = _buildRects[i];
+                    bool sel = (i == _selectedBuild);
+                    bool hov = (i == _hoverBuild);
+                    Color bg = sel ? UiTheme.SurfaceActive : (hov ? UiTheme.SurfaceHover : UiTheme.Surface);
+                    Color bd = sel ? UiTheme.Cyan : (hov ? UiTheme.BorderHover : UiTheme.Border);
+
+                    using (var path = UiTheme.RoundedRect(r, S(7)))
+                    using (var bBg = new SolidBrush(bg))
+                    using (var pen = new Pen(bd, sel ? 1.4f : 1f))
+                    {
+                        g.FillPath(bBg, path);
+                        g.DrawPath(pen, path);
+                    }
+                    using (var bName = new SolidBrush(sel ? UiTheme.Cyan : UiTheme.Text))
+                    {
+                        Rectangle nr = string.IsNullOrEmpty(b.Meta) ? r : new Rectangle(r.X, r.Y + S(3), r.Width, S(16));
+                        g.DrawString(b.Name, fPill, bName, nr, sfC);
+                    }
+                    if (!string.IsNullOrEmpty(b.Meta))
+                    {
+                        Rectangle mr = new Rectangle(r.X, r.Y + S(18), r.Width, S(13));
+                        using (var fMicro = new Font("Segoe UI", 6.8f))
+                            g.DrawString(b.Meta, fMicro, bMut, mr, sfC);
+                    }
+                }
+
+                // Section 2: Presets
+                g.DrawString("PERFIL GRÁFICO", fSec, bMut, pad, S(124));
+                for (int i = 0; i < _presetRects.Length; i++)
+                {
+                    PresetEntry pItem = _presets[i];
+                    Rectangle r = _presetRects[i];
+                    bool sel = (i == _selectedPreset);
+                    bool hov = (i == _hoverPreset);
+
+                    Color bg = sel ? UiTheme.SurfaceActive : (hov ? UiTheme.SurfaceHover : UiTheme.Surface);
+                    Color bd = sel ? UiTheme.Cyan : (hov ? UiTheme.BorderHover : UiTheme.Border);
+                    using (var path = UiTheme.RoundedRect(r, S(8)))
+                    using (var bBg = new SolidBrush(bg))
+                    using (var pen = new Pen(bd, sel ? 1.4f : 1f))
+                    {
+                        g.FillPath(bBg, path);
+                        g.DrawPath(pen, path);
+                    }
+                    if (sel)
+                    {
+                        Rectangle bar = new Rectangle(r.X + 1, r.Y + S(8), S(3), r.Height - S(16));
+                        using (var grad = new LinearGradientBrush(bar, UiTheme.Pink, UiTheme.Cyan, 90f))
+                            g.FillRectangle(grad, bar);
+                    }
+
+                    g.DrawString(pItem.Title, fItem, bTxt, r.X + S(13), r.Y + S(5));
+                    g.DrawString(pItem.Subtitle, fItemSub, bMut, r.X + S(13), r.Y + S(23));
+
+                    int tw = (int)g.MeasureString(pItem.Tag, fPill).Width + S(14);
+                    Rectangle tr = new Rectangle(r.Right - tw - S(10), r.Y + S(11), tw, S(20));
+                    using (var tp = UiTheme.RoundedRect(tr, S(9)))
+                    using (var tb = new SolidBrush(Color.FromArgb(26, pItem.TagColor)))
+                    using (var tt = new SolidBrush(pItem.TagColor))
+                    {
+                        g.FillPath(tb, tp);
+                        g.DrawString(pItem.Tag, fPill, tt, tr, sfC);
+                    }
+                }
+
+                // Section 3: Compact 2-column toggles
+                DrawCheck(g, _chkUnified, _unifiedMemory, "Memória Unificada (Tiled)", UiTheme.Cyan, _hoverCtrl == 10);
+                DrawCheck(g, _chkBoost, _cpuGpuBoost, "Boost CPU↔GPU (v1.2)", UiTheme.Green, _hoverCtrl == 11);
+                DrawCheck(g, _chkLite, _liteGraphics, "Modo Gráfico Leve", UiTheme.Amber, _hoverCtrl == 12);
+                DrawCheck(g, _chkHud, _enableHud, "HUD de FPS", UiTheme.Cyan, _hoverCtrl == 13);
+
+                string rpcLbl = _discordRpc && string.IsNullOrEmpty(_discordAppId) ? "Discord RPC (sem ID)" : "Discord Rich Presence";
+                DrawCheck(g, _chkDiscord, _discordRpc, rpcLbl, UiTheme.Blurple, _hoverCtrl == 14);
+                DrawMiniPill(g, _btnDiscordCfg, string.IsNullOrEmpty(_discordAppId) ? "Set ID" : "ID ✓", UiTheme.Blurple, _hoverCtrl == 4, sfC);
+
+                DrawCheck(g, _chkClose, _closeOnLaunch, "Fechar ao Jogar", UiTheme.Slate, _hoverCtrl == 15);
+
+                // Section 4: Action bar
+                DrawActionBtn(g, _btnControls, _mouseCamera ? "Controles •" : "Controles", false, _hoverCtrl == 1, sfC);
+                DrawActionBtn(g, _btnShaders, "Shaders", false, _hoverCtrl == 2, sfC);
+                DrawActionBtn(g, _btnLogs, "Logs", false, _hoverCtrl == 3, sfC);
+
+                string verTag = (_selectedBuild >= 0 && _selectedBuild < _builds.Count) ? _builds[_selectedBuild].Name : "";
+                DrawActionBtn(g, _btnPlay, "▶  JOGAR  (" + verTag + ")", true, _hoverCtrl == 0, sfC);
+
+                if (!string.IsNullOrEmpty(_status))
+                {
+                    using (var bSt = new SolidBrush(UiTheme.Amber))
+                        g.DrawString(_status, fSub, bSt, pad, ClientSize.Height - S(20));
                 }
             }
         }
 
-        private void EnableDarkTitleBar()
+        private void DrawCheck(Graphics g, Rectangle r, bool on, string label, Color accent, bool hov)
         {
+            Rectangle box = new Rectangle(r.X, r.Y + S(4), S(14), S(14));
+            using (var bp = UiTheme.RoundedRect(box, S(4)))
+            using (var bf = new SolidBrush(on ? accent : UiTheme.Surface))
+            using (var pen = new Pen(on ? accent : (hov ? UiTheme.BorderHover : UiTheme.Border), 1.2f))
+            {
+                g.FillPath(bf, bp);
+                g.DrawPath(pen, bp);
+            }
+            if (on)
+            {
+                using (var p = new Pen(UiTheme.Bg, 1.9f))
+                {
+                    g.DrawLine(p, box.X + S(3), box.Y + S(7), box.X + S(6), box.Y + S(10));
+                    g.DrawLine(p, box.X + S(6), box.Y + S(10), box.X + S(11), box.Y + S(4));
+                }
+            }
+            using (var f = new Font("Segoe UI", 8.4f))
+            using (var b = new SolidBrush(on || hov ? UiTheme.Text : UiTheme.Muted))
+                g.DrawString(label, f, b, box.Right + S(7), r.Y + S(3));
+        }
+
+        private void DrawMiniPill(Graphics g, Rectangle r, string txt, Color col, bool hov, StringFormat sf)
+        {
+            using (var p = UiTheme.RoundedRect(r, S(5)))
+            using (var bf = new SolidBrush(hov ? Color.FromArgb(46, col) : Color.FromArgb(24, col)))
+            using (var pen = new Pen(Color.FromArgb(hov ? 180 : 100, col), 1f))
+            using (var f = new Font("Segoe UI Semibold", 7.3f, FontStyle.Bold))
+            using (var bt = new SolidBrush(col))
+            {
+                g.FillPath(bf, p);
+                g.DrawPath(pen, p);
+                g.DrawString(txt, f, bt, r, sf);
+            }
+        }
+
+        private void DrawActionBtn(Graphics g, Rectangle r, string text, bool primary, bool hov, StringFormat sf)
+        {
+            using (var path = UiTheme.RoundedRect(r, S(8)))
+            {
+                if (primary)
+                {
+                    Color c1 = hov ? Color.FromArgb(255, 86, 164) : UiTheme.Pink;
+                    Color c2 = hov ? Color.FromArgb(62, 228, 250) : UiTheme.Cyan;
+                    using (var grad = new LinearGradientBrush(r, c1, c2, 0f))
+                        g.FillPath(grad, path);
+                }
+                else
+                {
+                    using (var bf = new SolidBrush(hov ? UiTheme.SurfaceHover : UiTheme.Surface))
+                    using (var pen = new Pen(hov ? UiTheme.BorderHover : UiTheme.Border, 1f))
+                    {
+                        g.FillPath(bf, path);
+                        g.DrawPath(pen, path);
+                    }
+                }
+            }
+            using (var f = new Font("Segoe UI Semibold", primary ? 9.2f : 8.4f, FontStyle.Bold))
+            using (var bt = new SolidBrush(primary ? Color.FromArgb(10, 12, 18) : UiTheme.Text))
+                g.DrawString(text, f, bt, r, sf);
+        }
+
+        private void OnMouseMoveCanvas(object sender, MouseEventArgs e)
+        {
+            int ob = _hoverBuild, op = _hoverPreset, oc = _hoverCtrl;
+            _hoverBuild = -1; _hoverPreset = -1; _hoverCtrl = -1;
+
+            for (int i = 0; i < _buildRects.Length; i++)
+                if (_buildRects[i].Contains(e.Location)) { _hoverBuild = i; break; }
+            for (int i = 0; i < _presetRects.Length; i++)
+                if (_presetRects[i].Contains(e.Location)) { _hoverPreset = i; break; }
+
+            if (_btnPlay.Contains(e.Location)) _hoverCtrl = 0;
+            else if (_btnControls.Contains(e.Location)) _hoverCtrl = 1;
+            else if (_btnShaders.Contains(e.Location)) _hoverCtrl = 2;
+            else if (_btnLogs.Contains(e.Location)) _hoverCtrl = 3;
+            else if (_btnDiscordCfg.Contains(e.Location)) _hoverCtrl = 4;
+            else if (_chkUnified.Contains(e.Location)) _hoverCtrl = 10;
+            else if (_chkBoost.Contains(e.Location)) _hoverCtrl = 11;
+            else if (_chkLite.Contains(e.Location)) _hoverCtrl = 12;
+            else if (_chkHud.Contains(e.Location)) _hoverCtrl = 13;
+            else if (_chkDiscord.Contains(e.Location)) _hoverCtrl = 14;
+            else if (_chkClose.Contains(e.Location)) _hoverCtrl = 15;
+
+            Cursor = (_hoverBuild >= 0 || _hoverPreset >= 0 || _hoverCtrl >= 0) ? Cursors.Hand : Cursors.Default;
+            if (ob != _hoverBuild || op != _hoverPreset || oc != _hoverCtrl) Invalidate();
+        }
+
+        private void OnMouseDownCanvas(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+
+            for (int i = 0; i < _buildRects.Length; i++)
+            {
+                if (_buildRects[i].Contains(e.Location))
+                {
+                    _selectedBuild = i;
+                    _status = "Versão selecionada: " + _builds[i].Name;
+                    SaveConfig();
+                    Invalidate();
+                    return;
+                }
+            }
+            for (int i = 0; i < _presetRects.Length; i++)
+            {
+                if (_presetRects[i].Contains(e.Location))
+                {
+                    _selectedPreset = i;
+                    _status = "";
+                    SaveConfig();
+                    Invalidate();
+                    return;
+                }
+            }
+
+            if (_chkUnified.Contains(e.Location)) { _unifiedMemory = !_unifiedMemory; SaveConfig(); Invalidate(); }
+            else if (_chkBoost.Contains(e.Location)) { _cpuGpuBoost = !_cpuGpuBoost; SaveConfig(); Invalidate(); }
+            else if (_chkLite.Contains(e.Location)) { _liteGraphics = !_liteGraphics; SaveConfig(); Invalidate(); }
+            else if (_chkHud.Contains(e.Location)) { _enableHud = !_enableHud; SaveConfig(); Invalidate(); }
+            else if (_chkClose.Contains(e.Location)) { _closeOnLaunch = !_closeOnLaunch; SaveConfig(); Invalidate(); }
+            else if (_chkDiscord.Contains(e.Location))
+            {
+                _discordRpc = !_discordRpc;
+                if (_discordRpc && string.IsNullOrEmpty(_discordAppId)) OpenDiscordConfig();
+                else { SaveConfig(); Invalidate(); }
+            }
+            else if (_btnDiscordCfg.Contains(e.Location)) { OpenDiscordConfig(); }
+            else if (_btnControls.Contains(e.Location)) { OpenControlsDialog(); }
+            else if (_btnShaders.Contains(e.Location))
+            {
+                if (File.Exists(PrecompileBat))
+                    Process.Start(new ProcessStartInfo { FileName = PrecompileBat, WorkingDirectory = Path.GetDirectoryName(PrecompileBat), UseShellExecute = true });
+                else { _status = "Script de pré-compilação não encontrado."; Invalidate(); }
+            }
+            else if (_btnLogs.Contains(e.Location))
+            {
+                try { Process.Start("explorer.exe", DataDir); } catch { }
+            }
+            else if (_btnPlay.Contains(e.Location)) { LaunchSelected(); }
+        }
+
+        private void OnMouseDoubleClickCanvas(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            for (int i = 0; i < _presetRects.Length; i++)
+            {
+                if (_presetRects[i].Contains(e.Location)) { _selectedPreset = i; SaveConfig(); LaunchSelected(); return; }
+            }
+        }
+
+        private void OnKeyDownCanvas(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Up && _selectedPreset > 0) { _selectedPreset--; SaveConfig(); Invalidate(); }
+            else if (e.KeyCode == Keys.Down && _selectedPreset < _presets.Count - 1) { _selectedPreset++; SaveConfig(); Invalidate(); }
+            else if (e.KeyCode == Keys.Left && _selectedBuild > 0) { _selectedBuild--; SaveConfig(); Invalidate(); }
+            else if (e.KeyCode == Keys.Right && _selectedBuild < _buildRects.Length - 1) { _selectedBuild++; SaveConfig(); Invalidate(); }
+            else if (e.KeyCode == Keys.Enter) LaunchSelected();
+            else if (e.KeyCode == Keys.Escape) Close();
+        }
+
+        private void OpenDiscordConfig()
+        {
+            using (var dlg = new DiscordConfigForm(_discordAppId, _discordHideTitle))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    _discordAppId = dlg.AppIdValue;
+                    _discordHideTitle = dlg.HideTitleValue;
+                    if (!string.IsNullOrEmpty(_discordAppId)) _discordRpc = true;
+                    _status = string.IsNullOrEmpty(_discordAppId) ? "Discord App ID limpo." : ("Discord RPC salvo (ID " + _discordAppId + ").");
+                    SaveConfig();
+                    Invalidate();
+                }
+            }
+        }
+
+        private void OpenControlsDialog()
+        {
+            using (var dlg = new ControlsForm(_mouseCamera, _mouseInvertY, _mouseSens, _mouseButtons, _keymap, _scale))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    _mouseCamera = dlg.MouseCamera;
+                    _mouseInvertY = dlg.MouseInvertY;
+                    _mouseSens = dlg.MouseSens;
+                    _mouseButtons = dlg.MouseButtonsMode;
+                    _status = "Controles salvos.";
+                    SaveConfig();
+                    Invalidate();
+                }
+            }
+        }
+
+        private void LaunchSelected()
+        {
+            if (_selectedBuild < 0 || _selectedBuild >= _builds.Count) return;
+            BuildEntry build = _builds[_selectedBuild];
+            if (string.IsNullOrEmpty(build.ExePath) || !File.Exists(build.ExePath))
+            {
+                _status = "Executável da versão " + build.Name + " não encontrado.";
+                Invalidate();
+                return;
+            }
+            if (!File.Exists(Ps1Path))
+            {
+                _status = "run-klbf-lab39.ps1 não encontrado.";
+                Invalidate();
+                return;
+            }
+
+            PresetEntry preset = _presets[_selectedPreset];
+            SaveConfig();
+
+            var parts = new List<string>();
+            if (!string.IsNullOrEmpty(preset.Args)) parts.Add(preset.Args);
+            parts.Add("-ExePath \"" + build.ExePath + "\"");
+            if (!_enableHud) parts.Add("-NoHud");
+            if (!_unifiedMemory) parts.Add("-NoUnifiedMemory");
+            if (_liteGraphics) parts.Add("-LiteGraphics");
+            if (_cpuGpuBoost) parts.Add("-CpuGpuBoost");
+            if (_discordRpc)
+            {
+                parts.Add("-DiscordRpc");
+                if (!string.IsNullOrEmpty(_discordAppId)) parts.Add("-DiscordAppId \"" + _discordAppId + "\"");
+                if (_discordHideTitle) parts.Add("-DiscordHideTitle");
+            }
+            if (_mouseCamera)
+            {
+                parts.Add("-MouseCamera");
+                parts.Add("-MouseSens " + _mouseSens.ToString("0.00", CultureInfo.InvariantCulture));
+                if (_mouseInvertY) parts.Add("-MouseInvertY");
+            }
+            if (_mouseButtons != "off") parts.Add("-MouseButtons " + _mouseButtons);
+            string km = SerializeCustomKeymap();
+            if (!string.IsNullOrEmpty(km)) parts.Add("-Keymap \"" + km + "\"");
+
             try
             {
-                int dark = 1;
-                DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int));
-                int corner = 2;
-                DwmSetWindowAttribute(Handle, 33, ref corner, sizeof(int));
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + Ps1Path + "\" " + string.Join(" ", parts.ToArray()),
+                    WorkingDirectory = RepoDir,
+                    UseShellExecute = true
+                });
+
+                if (_closeOnLaunch) Close();
+                else { _status = "Iniciado: " + build.Name + " • " + preset.Title; TrimMemory(); Invalidate(); }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                _status = "Erro: " + ex.Message;
+                Invalidate();
+            }
         }
 
         private static void TrimMemory()
@@ -605,812 +1354,6 @@ namespace VictoryLauncher
                 SetProcessWorkingSetSize(h, (IntPtr)(-1), (IntPtr)(-1));
             }
             catch { }
-        }
-
-        private void LoadConfig()
-        {
-            try
-            {
-                if (!File.Exists(ConfigPath)) return;
-                foreach (string raw in File.ReadAllLines(ConfigPath))
-                {
-                    int eq = raw.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string k = raw.Substring(0, eq).Trim();
-                    string v = raw.Substring(eq + 1).Trim();
-                    if (k == "selected")
-                    {
-                        int idx;
-                        if (int.TryParse(v, out idx) && idx >= 0 && idx < _versions.Count) _selectedIndex = idx;
-                    }
-                    else if (k == "hud") _enableHud = (v == "1");
-                    else if (k == "close_on_launch") _closeOnLaunch = (v == "1");
-                    else if (k == "unified_memory") _unifiedMemory = (v != "0");
-                    else if (k == "lite_graphics") _liteGraphics = (v == "1");
-                    else if (k == "mouse_camera") _mouseCamera = (v == "1");
-                    else if (k == "mouse_invert_y") _mouseInvertY = (v == "1");
-                    else if (k == "mouse_sens")
-                    {
-                        float s;
-                        if (float.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out s))
-                            _mouseSens = Math.Max(0.2f, Math.Min(4.0f, s));
-                    }
-                    else if (k == "mouse_buttons" && (v == "rmb_shoot" || v == "lmb_shoot" || v == "off"))
-                    {
-                        _mouseButtons = v;
-                    }
-                    else if (k == "keymap")
-                    {
-                        ApplyKeymapString(v);
-                    }
-                }
-            }
-            catch { }
-        }
-
-        private void SaveConfig()
-        {
-            try
-            {
-                Directory.CreateDirectory(DataDir);
-                string[] lines = new string[]
-                {
-                    "selected=" + _selectedIndex,
-                    "hud=" + (_enableHud ? "1" : "0"),
-                    "close_on_launch=" + (_closeOnLaunch ? "1" : "0"),
-                    "unified_memory=" + (_unifiedMemory ? "1" : "0"),
-                    "lite_graphics=" + (_liteGraphics ? "1" : "0"),
-                    "mouse_camera=" + (_mouseCamera ? "1" : "0"),
-                    "mouse_invert_y=" + (_mouseInvertY ? "1" : "0"),
-                    "mouse_sens=" + _mouseSens.ToString("0.00", CultureInfo.InvariantCulture),
-                    "mouse_buttons=" + _mouseButtons,
-                    "keymap=" + SerializeCustomKeymap()
-                };
-                File.WriteAllLines(ConfigPath, lines);
-            }
-            catch { }
-        }
-
-        private void LoadVersions()
-        {
-            bool ps1Ok = File.Exists(Ps1Path) && File.Exists(Path.Combine(RepoDir, "target", "release", "victory.exe"));
-            bool gleafOk = File.Exists(GLeafPs1Path) && File.Exists(GLeafExePath);
-
-            _versions.Add(new GameVersion
-            {
-                Title = "GLeaf-6 + Shaders Ka1qux + Lab 63 — FSR + FG (720p)",
-                Subtitle = "GLeaf + Ka1qux + Lab 63 (Cap 1024/512px, Skip Intro, PBR/Hair, CBV Fix)",
-                Badge = "GLEAF+L63",
-                BadgeColor = AccentPink,
-                Kind = "ps1",
-                Target = GLeafPs1Path,
-                Args = "-FrameGen -Res720p",
-                SupportsOptions = false,
-                Available = gleafOk
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "GLeaf-6 + Shaders Ka1qux + Lab 63 — FSR sem FG (720p)",
-                Subtitle = "GLeaf + Ka1qux + Lab 63 (PBR/Hair, Skip Intro, 768k Slots) • Sem FrameGen",
-                Badge = "GLEAF FSR",
-                BadgeColor = AccentBlue,
-                Kind = "ps1",
-                Target = GLeafPs1Path,
-                Args = "-Res720p",
-                SupportsOptions = false,
-                Available = gleafOk
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Tiled Pool (16 GB RAM) + Lab 63 — FSR 2.4 (720p)",
-                Subtitle = "Tiled Pool (-51% RAM) + Section Views 36x + Cap 1024/512px + LRU + Skip Intro",
-                Badge = "TILED+L63",
-                BadgeColor = AccentCyan,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "-Res720p",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Tiled Pool (16 GB RAM) — FSR + FrameGen (720p)",
-                Subtitle = "Tiled Pool (-51% RAM) + Geração de Quadros AMD • Estável em 16 GB",
-                Badge = "TILED + FG",
-                BadgeColor = AccentGreen,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "-FrameGen -Res720p",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Tiled Pool (16 GB RAM) — Simple (720p)",
-                Subtitle = "Upscaler bilinear ultraleve sem FSR • Menor consumo de VRAM e RAM",
-                Badge = "MAIS LEVE",
-                BadgeColor = AccentGreen,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "-SimpleUpscale -Res720p",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Tiled Pool (16 GB RAM) — FSR 2.4 (1080p)",
-                Subtitle = "Full HD nativo com AMD FSR 2.4 • Água KLBF 39 + 524k slots AMD",
-                Badge = "1080p FSR",
-                BadgeColor = AccentSlate,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Tiled Pool — Modo Seguro (720p)",
-                Subtitle = "Sem flags agressivas (LATE_WAIT=1, CopyPlain=0) • Máxima estabilidade",
-                Badge = "SEGURO",
-                BadgeColor = AccentAmber,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "-Safe -Res720p",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-        }
-
-        private void ComputeLayout()
-        {
-            _cardRects = new Rectangle[_versions.Count];
-            int pad = S(22);
-            int y = S(98);
-            int cardW = ClientSize.Width - pad * 2;
-            for (int i = 0; i < _versions.Count; i++)
-            {
-                _cardRects[i] = new Rectangle(pad, y, cardW, S(54));
-                y += S(60);
-            }
-
-            // Mouse & Keyboard Controls Panel
-            int panelY = y + S(10);
-            _mousePanelRect = new Rectangle(pad, panelY, cardW, S(156));
-            _mouseCamChkRect = new Rectangle(pad + S(14), panelY + S(28), S(390), S(22));
-            _invertYChkRect = new Rectangle(pad + cardW - S(155), panelY + S(28), S(140), S(22));
-            _sensTrackRect = new Rectangle(pad + S(128), panelY + S(58), cardW - S(196), S(18));
-
-            int btnRowY = panelY + S(84);
-            int segW = (cardW - S(28) - S(128) - S(12)) / 3;
-            int segX = pad + S(128);
-            _btnRmbRect = new Rectangle(segX, btnRowY, segW, S(24));
-            _btnLmbRect = new Rectangle(segX + segW + S(6), btnRowY, segW, S(24));
-            _btnOffRect = new Rectangle(segX + (segW + S(6)) * 2, btnRowY, segW, S(24));
-
-            int kmRowY = panelY + S(118);
-            _keymapBtnRect = new Rectangle(pad + S(14), kmRowY, S(212), S(26));
-
-            // Footer checkboxes (Row 1: Unified Memory; Row 2: Lite Graphics; Row 3: HUD + Close)
-            int footerY = _mousePanelRect.Bottom + S(12);
-            _unifiedChkRect = new Rectangle(pad, footerY, cardW, S(24));
-            int footerY15 = footerY + S(26);
-            _liteChkRect = new Rectangle(pad, footerY15, cardW, S(24));
-            int footerY2 = footerY15 + S(26);
-            _hudChkRect = new Rectangle(pad, footerY2, S(185), S(24));
-            _closeChkRect = new Rectangle(pad + S(196), footerY2, S(250), S(24));
-
-            int btnY = footerY2 + S(32);
-            _precompileRect = new Rectangle(pad, btnY, S(186), S(38));
-            _logsRect = new Rectangle(pad + S(196), btnY, S(120), S(38));
-            _playRect = new Rectangle(ClientSize.Width - pad - S(200), btnY, S(200), S(38));
-        }
-
-        private static GraphicsPath RoundedRect(Rectangle r, int radius)
-        {
-            int d = Math.Max(2, radius * 2);
-            GraphicsPath path = new GraphicsPath();
-            path.AddArc(r.X, r.Y, d, d, 180, 90);
-            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            path.CloseFigure();
-            return path;
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            Graphics g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-
-            using (var grad = new LinearGradientBrush(new Rectangle(0, 0, ClientSize.Width, S(3)), AccentPink, AccentCyan, 0f))
-            {
-                g.FillRectangle(grad, 0, 0, ClientSize.Width, S(3));
-            }
-
-            int pad = S(22);
-
-            // Header
-            using (var fTitle = new Font("Segoe UI Semibold", 16.5f, FontStyle.Bold))
-            using (var fSub = new Font("Segoe UI", 8.8f))
-            using (var fPill = new Font("Segoe UI Semibold", 7.6f, FontStyle.Bold))
-            using (var bTitle = new SolidBrush(TextPrimary))
-            using (var bMuted = new SolidBrush(TextMuted))
-            {
-                g.DrawString("GTA VI", fTitle, bTitle, pad, S(16));
-                SizeF gtaSz = g.MeasureString("GTA VI", fTitle);
-                using (var bAccent = new SolidBrush(AccentCyan))
-                {
-                    g.DrawString("VICTORY", fTitle, bAccent, pad + gtaSz.Width + S(2), S(16));
-                }
-
-                string memBadge = _unifiedMemory ? "UMA + Tiled Pool" : "Modo Clássico AMD";
-                g.DrawString("RX 6600 8 GB  •  Ryzen 5 4500  •  " + memBadge, fSub, bMuted, pad, S(47));
-
-                string cacheLabel = _cachePrecompiled ? "CACHE SHADERS OK" : "CACHE FRIO (PRÉ-COMPILE)";
-                Color cacheColor = _cachePrecompiled ? AccentGreen : AccentAmber;
-                SizeF sz = g.MeasureString(cacheLabel, fPill);
-                Rectangle pill = new Rectangle(ClientSize.Width - pad - (int)sz.Width - S(20), S(22), (int)sz.Width + S(20), S(22));
-                using (var pPath = RoundedRect(pill, S(11)))
-                using (var bBg = new SolidBrush(Color.FromArgb(26, cacheColor)))
-                using (var pPen = new Pen(Color.FromArgb(110, cacheColor), 1f))
-                using (var bTxt = new SolidBrush(cacheColor))
-                {
-                    g.FillPath(bBg, pPath);
-                    g.DrawPath(pPen, pPath);
-                    g.DrawString(cacheLabel, fPill, bTxt, pill.X + S(10), pill.Y + S(4));
-                }
-
-                g.DrawString("VERSÃO DO JOGO", fPill, bMuted, pad, S(78));
-            }
-
-            // Version cards
-            using (var fCardTitle = new Font("Segoe UI Semibold", 10f, FontStyle.Bold))
-            using (var fCardSub = new Font("Segoe UI", 8.2f))
-            using (var fBadge = new Font("Segoe UI Semibold", 7.2f, FontStyle.Bold))
-            {
-                for (int i = 0; i < _versions.Count; i++)
-                {
-                    GameVersion v = _versions[i];
-                    Rectangle r = _cardRects[i];
-                    bool sel = (i == _selectedIndex);
-                    bool hov = (i == _hoverIndex);
-
-                    Color bg = sel ? BgCardSelected : (hov ? BgCardHover : BgCard);
-                    Color border = sel ? AccentCyan : (hov ? Color.FromArgb(65, 78, 104) : BorderSubtle);
-
-                    using (var path = RoundedRect(r, S(9)))
-                    using (var bBg = new SolidBrush(bg))
-                    using (var pBorder = new Pen(border, sel ? 1.5f : 1f))
-                    {
-                        g.FillPath(bBg, path);
-                        g.DrawPath(pBorder, path);
-                    }
-
-                    if (sel)
-                    {
-                        Rectangle bar = new Rectangle(r.X + 1, r.Y + S(11), S(3), r.Height - S(22));
-                        using (var grad = new LinearGradientBrush(bar, AccentPink, AccentCyan, 90f))
-                        {
-                            g.FillRectangle(grad, bar);
-                        }
-                    }
-
-                    using (var bT = new SolidBrush(v.Available ? TextPrimary : TextMuted))
-                    using (var bS = new SolidBrush(TextMuted))
-                    {
-                        g.DrawString(v.Title, fCardTitle, bT, r.X + S(14), r.Y + S(8));
-                        g.DrawString(v.Subtitle, fCardSub, bS, r.X + S(14), r.Y + S(30));
-                    }
-
-                    SizeF bsz = g.MeasureString(v.Badge, fBadge);
-                    Rectangle br = new Rectangle(r.Right - (int)bsz.Width - S(24), r.Y + S(9), (int)bsz.Width + S(14), S(18));
-                    using (var bp = RoundedRect(br, S(9)))
-                    using (var bBg = new SolidBrush(Color.FromArgb(30, v.BadgeColor)))
-                    using (var bTxt = new SolidBrush(v.BadgeColor))
-                    {
-                        g.FillPath(bBg, bp);
-                        g.DrawString(v.Badge, fBadge, bTxt, br.X + S(7), br.Y + S(2));
-                    }
-                }
-            }
-
-            // Mouse & Keyboard Controls Panel
-            DrawMousePanel(g);
-
-            // Footer checkboxes
-            string memLabel = _unifiedMemory
-                ? "Memória Unificada (UMA + Tiled Pool) — desmarque p/ Modo Clássico AMD"
-                : "Modo Clássico AMD (sem Memória Unificada / como era antes)";
-            DrawCheckbox(g, _unifiedChkRect, _unifiedMemory, memLabel, _hoverCtrl == 11);
-            DrawCheckbox(g, _liteChkRect, _liteGraphics, "Modo Gráfico Leve (Iluminação Baixa • Shaders Lite • Texturas Leves)", _hoverCtrl == 13);
-            DrawCheckbox(g, _hudChkRect, _enableHud, "HUD de desempenho", _hoverCtrl == 3);
-            DrawCheckbox(g, _closeChkRect, _closeOnLaunch, "Fechar ao jogar (0 MB RAM)", _hoverCtrl == 4);
-
-            // Buttons
-            DrawButton(g, _precompileRect, "Pré-Compilar Shaders", false, _hoverCtrl == 1);
-            DrawButton(g, _logsRect, "Abrir Logs", false, _hoverCtrl == 2);
-            DrawButton(g, _playRect, "▶   JOGAR AGORA", true, _hoverCtrl == 0);
-
-            if (!string.IsNullOrEmpty(_statusText))
-            {
-                using (var fSt = new Font("Segoe UI", 8f))
-                using (var bSt = new SolidBrush(AccentAmber))
-                {
-                    g.DrawString(_statusText, fSt, bSt, pad, ClientSize.Height - S(18));
-                }
-            }
-        }
-
-        private void DrawMousePanel(Graphics g)
-        {
-            using (var path = RoundedRect(_mousePanelRect, S(10)))
-            using (var bBg = new SolidBrush(BgPanel))
-            using (var pBorder = new Pen(_mouseCamera ? Color.FromArgb(90, AccentCyan) : BorderSubtle, 1f))
-            {
-                g.FillPath(bBg, path);
-                g.DrawPath(pBorder, path);
-            }
-
-            using (var fHdr = new Font("Segoe UI Semibold", 7.5f, FontStyle.Bold))
-            using (var fLbl = new Font("Segoe UI", 8.5f))
-            using (var fVal = new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold))
-            using (var bMuted = new SolidBrush(TextMuted))
-            using (var bAccent = new SolidBrush(_mouseCamera ? AccentCyan : TextMuted))
-            {
-                g.DrawString("CONTROLES — MOUSE E MAPEAMENTO XBOX → TECLADO", fHdr, bAccent, _mousePanelRect.X + S(14), _mousePanelRect.Y + S(8));
-
-                // Row 1: Checkboxes
-                DrawCheckbox(g, _mouseCamChkRect, _mouseCamera, "Mouse como Câmera (Analógico Direito • F9 trava/solta)", _hoverCtrl == 5);
-                DrawCheckbox(g, _invertYChkRect, _mouseInvertY, "Inverter Eixo Y", _hoverCtrl == 6);
-
-                // Row 2: Sensitivity slider
-                g.DrawString("Sensibilidade:", fLbl, bMuted, _mousePanelRect.X + S(14), _sensTrackRect.Y + S(1));
-
-                int trackY = _sensTrackRect.Y + _sensTrackRect.Height / 2;
-                int trackH = S(4);
-                Rectangle bgTrack = new Rectangle(_sensTrackRect.X, trackY - trackH / 2, _sensTrackRect.Width, trackH);
-                float norm = (_mouseSens - 0.2f) / (4.0f - 0.2f);
-                norm = Math.Max(0f, Math.Min(1f, norm));
-                int fillW = Math.Max(S(4), (int)(bgTrack.Width * norm));
-                Rectangle fillTrack = new Rectangle(bgTrack.X, bgTrack.Y, fillW, trackH);
-
-                using (var pBg = RoundedRect(bgTrack, S(2)))
-                using (var bTr = new SolidBrush(BorderSubtle))
-                {
-                    g.FillPath(bTr, pBg);
-                }
-                using (var pFill = RoundedRect(fillTrack, S(2)))
-                using (var grad = new LinearGradientBrush(bgTrack, AccentPink, AccentCyan, 0f))
-                {
-                    g.FillPath(grad, pFill);
-                }
-
-                int knobD = S(13);
-                int knobX = bgTrack.X + (int)(bgTrack.Width * norm) - knobD / 2;
-                int knobY = trackY - knobD / 2;
-                using (var bKnob = new SolidBrush(_draggingSens || _hoverCtrl == 7 ? TextPrimary : AccentCyan))
-                using (var pKnob = new Pen(BgWindow, 1.5f))
-                {
-                    g.FillEllipse(bKnob, knobX, knobY, knobD, knobD);
-                    g.DrawEllipse(pKnob, knobX, knobY, knobD, knobD);
-                }
-
-                string sensText = _mouseSens.ToString("0.0", CultureInfo.InvariantCulture) + "x";
-                g.DrawString(sensText, fVal, bAccent, _sensTrackRect.Right + S(12), _sensTrackRect.Y + S(1));
-
-                // Row 3: Mouse button mapping pills
-                g.DrawString("Botões Mouse:", fLbl, bMuted, _mousePanelRect.X + S(14), _btnRmbRect.Y + S(4));
-                DrawSegmentPill(g, _btnRmbRect, "Dir: Atirar | Esq: Mirar", _mouseButtons == "rmb_shoot", _hoverCtrl == 8);
-                DrawSegmentPill(g, _btnLmbRect, "Esq: Atirar | Dir: Mirar", _mouseButtons == "lmb_shoot", _hoverCtrl == 9);
-                DrawSegmentPill(g, _btnOffRect, "Desativado", _mouseButtons == "off", _hoverCtrl == 10);
-
-                // Row 4: Xbox -> Keyboard remapper button + active summary
-                string customSpec = SerializeCustomKeymap();
-                bool hasCustom = !string.IsNullOrEmpty(customSpec);
-                DrawSegmentPill(g, _keymapBtnRect, "⌨  Mapear Botões Xbox → Teclado", hasCustom, _hoverCtrl == 12);
-
-                string summary = hasCustom ? ("Ativo: " + customSpec) : "Padrão (WASD, Enter=A, Back=B, X, Y, Q/E, Z/C)";
-                if (summary.Length > 52) summary = summary.Substring(0, 49) + "...";
-                using (var bSum = new SolidBrush(hasCustom ? AccentGreen : TextMuted))
-                {
-                    g.DrawString(summary, fLbl, bSum, _keymapBtnRect.Right + S(12), _keymapBtnRect.Y + S(5));
-                }
-            }
-        }
-
-        private void DrawSegmentPill(Graphics g, Rectangle r, string label, bool active, bool hover)
-        {
-            Color bg = active ? Color.FromArgb(38, AccentCyan) : (hover ? BgCardHover : BgCard);
-            Color border = active ? AccentCyan : (hover ? Color.FromArgb(72, 86, 114) : BorderSubtle);
-            Color txt = active ? AccentCyan : (hover ? TextPrimary : TextMuted);
-
-            using (var path = RoundedRect(r, S(6)))
-            using (var bBg = new SolidBrush(bg))
-            using (var pPen = new Pen(border, active ? 1.2f : 1f))
-            using (var f = new Font("Segoe UI Semibold", 7.8f, FontStyle.Bold))
-            using (var bTxt = new SolidBrush(txt))
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            {
-                g.FillPath(bBg, path);
-                g.DrawPath(pPen, path);
-                g.DrawString(label, f, bTxt, r, sf);
-            }
-        }
-
-        private void DrawCheckbox(Graphics g, Rectangle r, bool checkedState, string label, bool hover)
-        {
-            Rectangle box = new Rectangle(r.X, r.Y + S(3), S(15), S(15));
-            using (var bp = RoundedRect(box, S(4)))
-            using (var bFill = new SolidBrush(checkedState ? AccentCyan : BgCard))
-            using (var pPen = new Pen(checkedState ? AccentCyan : (hover ? TextMuted : BorderSubtle), 1.2f))
-            {
-                g.FillPath(bFill, bp);
-                g.DrawPath(pPen, bp);
-            }
-
-            if (checkedState)
-            {
-                using (var pChk = new Pen(BgWindow, 2f))
-                {
-                    g.DrawLine(pChk, box.X + S(3), box.Y + S(7), box.X + S(6), box.Y + S(11));
-                    g.DrawLine(pChk, box.X + S(6), box.Y + S(11), box.X + S(12), box.Y + S(4));
-                }
-            }
-
-            using (var f = new Font("Segoe UI", 8.6f))
-            using (var b = new SolidBrush(hover || checkedState ? TextPrimary : TextMuted))
-            {
-                g.DrawString(label, f, b, box.Right + S(8), r.Y + S(2));
-            }
-        }
-
-        private void DrawButton(Graphics g, Rectangle r, string text, bool primary, bool hover)
-        {
-            using (var path = RoundedRect(r, S(9)))
-            {
-                if (primary)
-                {
-                    Color c1 = hover ? Color.FromArgb(255, 86, 164) : AccentPink;
-                    Color c2 = hover ? Color.FromArgb(56, 228, 250) : AccentCyan;
-                    using (var grad = new LinearGradientBrush(r, c1, c2, 0f))
-                    {
-                        g.FillPath(grad, path);
-                    }
-                }
-                else
-                {
-                    using (var bBg = new SolidBrush(hover ? BgCardHover : BgCard))
-                    using (var pPen = new Pen(hover ? Color.FromArgb(72, 86, 114) : BorderSubtle, 1f))
-                    {
-                        g.FillPath(bBg, path);
-                        g.DrawPath(pPen, path);
-                    }
-                }
-            }
-
-            using (var f = new Font("Segoe UI Semibold", primary ? 9.6f : 8.6f, FontStyle.Bold))
-            using (var bTxt = new SolidBrush(primary ? Color.FromArgb(10, 12, 18) : TextPrimary))
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            {
-                g.DrawString(text, f, bTxt, r, sf);
-            }
-        }
-
-        private void UpdateSensFromX(int mouseX)
-        {
-            float norm = (float)(mouseX - _sensTrackRect.X) / Math.Max(1, _sensTrackRect.Width);
-            norm = Math.Max(0f, Math.Min(1f, norm));
-            float val = 0.2f + norm * (4.0f - 0.2f);
-            _mouseSens = (float)Math.Round(val * 10f) / 10f;
-            Invalidate();
-        }
-
-        private void OnMouseMoveCanvas(object sender, MouseEventArgs e)
-        {
-            if (_draggingSens)
-            {
-                UpdateSensFromX(e.X);
-                return;
-            }
-
-            int oldIdx = _hoverIndex;
-            int oldCtrl = _hoverCtrl;
-            _hoverIndex = -1;
-            _hoverCtrl = -1;
-
-            for (int i = 0; i < _cardRects.Length; i++)
-            {
-                if (_cardRects[i].Contains(e.Location))
-                {
-                    _hoverIndex = i;
-                    break;
-                }
-            }
-
-            if (_playRect.Contains(e.Location)) _hoverCtrl = 0;
-            else if (_precompileRect.Contains(e.Location)) _hoverCtrl = 1;
-            else if (_logsRect.Contains(e.Location)) _hoverCtrl = 2;
-            else if (_hudChkRect.Contains(e.Location)) _hoverCtrl = 3;
-            else if (_closeChkRect.Contains(e.Location)) _hoverCtrl = 4;
-            else if (_mouseCamChkRect.Contains(e.Location)) _hoverCtrl = 5;
-            else if (_invertYChkRect.Contains(e.Location)) _hoverCtrl = 6;
-            else if (_sensTrackRect.Contains(e.Location)) _hoverCtrl = 7;
-            else if (_btnRmbRect.Contains(e.Location)) _hoverCtrl = 8;
-            else if (_btnLmbRect.Contains(e.Location)) _hoverCtrl = 9;
-            else if (_btnOffRect.Contains(e.Location)) _hoverCtrl = 10;
-            else if (_unifiedChkRect.Contains(e.Location)) _hoverCtrl = 11;
-            else if (_keymapBtnRect.Contains(e.Location)) _hoverCtrl = 12;
-            else if (_liteChkRect.Contains(e.Location)) _hoverCtrl = 13;
-
-            Cursor = (_hoverIndex >= 0 || _hoverCtrl >= 0) ? Cursors.Hand : Cursors.Default;
-            if (oldIdx != _hoverIndex || oldCtrl != _hoverCtrl)
-                Invalidate();
-        }
-
-        private void OnMouseDownCanvas(object sender, MouseEventArgs e)
-        {
-            if (e.Button != MouseButtons.Left) return;
-
-            for (int i = 0; i < _cardRects.Length; i++)
-            {
-                if (_cardRects[i].Contains(e.Location))
-                {
-                    _selectedIndex = i;
-                    _statusText = "";
-                    SaveConfig();
-                    Invalidate();
-                    return;
-                }
-            }
-
-            if (_mouseCamChkRect.Contains(e.Location))
-            {
-                _mouseCamera = !_mouseCamera;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_invertYChkRect.Contains(e.Location))
-            {
-                _mouseInvertY = !_mouseInvertY;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_sensTrackRect.Contains(e.Location))
-            {
-                _draggingSens = true;
-                UpdateSensFromX(e.X);
-            }
-            else if (_btnRmbRect.Contains(e.Location))
-            {
-                _mouseButtons = "rmb_shoot";
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_btnLmbRect.Contains(e.Location))
-            {
-                _mouseButtons = "lmb_shoot";
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_btnOffRect.Contains(e.Location))
-            {
-                _mouseButtons = "off";
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_keymapBtnRect.Contains(e.Location))
-            {
-                OpenKeymapDialog();
-            }
-            else if (_unifiedChkRect.Contains(e.Location))
-            {
-                _unifiedMemory = !_unifiedMemory;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_liteChkRect.Contains(e.Location))
-            {
-                _liteGraphics = !_liteGraphics;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_hudChkRect.Contains(e.Location))
-            {
-                _enableHud = !_enableHud;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_closeChkRect.Contains(e.Location))
-            {
-                _closeOnLaunch = !_closeOnLaunch;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (_playRect.Contains(e.Location))
-            {
-                LaunchSelected();
-            }
-            else if (_precompileRect.Contains(e.Location))
-            {
-                bool isGLeaf = _selectedIndex >= 0 && _selectedIndex < _versions.Count && _versions[_selectedIndex].Target == GLeafPs1Path;
-                LaunchFile(isGLeaf ? GLeafPrecompileBat : PrecompileBat, "");
-            }
-            else if (_logsRect.Contains(e.Location))
-            {
-                try { Process.Start("explorer.exe", DataDir); } catch { }
-            }
-        }
-
-        private void OpenKeymapDialog()
-        {
-            var copy = new List<KeyBindingItem>(_keymap.Count);
-            foreach (var it in _keymap)
-            {
-                copy.Add(new KeyBindingItem
-                {
-                    Id = it.Id,
-                    Label = it.Label,
-                    DefaultKey = it.DefaultKey,
-                    Key = it.Key,
-                    Accent = it.Accent
-                });
-            }
-            using (var dlg = new KeymapForm(copy, _scale))
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    for (int i = 0; i < _keymap.Count; i++)
-                    {
-                        _keymap[i].Key = copy[i].Key;
-                    }
-                    SaveConfig();
-                    _statusText = "Mapeamento de controles salvo.";
-                    Invalidate();
-                }
-            }
-        }
-
-        private void OnMouseDoubleClickCanvas(object sender, MouseEventArgs e)
-        {
-            if (e.Button != MouseButtons.Left) return;
-            for (int i = 0; i < _cardRects.Length; i++)
-            {
-                if (_cardRects[i].Contains(e.Location))
-                {
-                    _selectedIndex = i;
-                    SaveConfig();
-                    LaunchSelected();
-                    return;
-                }
-            }
-        }
-
-        private void OnKeyDownCanvas(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Up && _selectedIndex > 0)
-            {
-                _selectedIndex--;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (e.KeyCode == Keys.Down && _selectedIndex < _versions.Count - 1)
-            {
-                _selectedIndex++;
-                SaveConfig();
-                Invalidate();
-            }
-            else if (e.KeyCode == Keys.Enter)
-            {
-                LaunchSelected();
-            }
-            else if (e.KeyCode == Keys.Escape)
-            {
-                Close();
-            }
-        }
-
-        private void LaunchSelected()
-        {
-            if (_selectedIndex < 0 || _selectedIndex >= _versions.Count) return;
-            GameVersion v = _versions[_selectedIndex];
-            if (!v.Available)
-            {
-                _statusText = "Build ainda não disponível em disco.";
-                Invalidate();
-                return;
-            }
-
-            SaveConfig();
-            try
-            {
-                if (v.Kind == "ps1")
-                {
-                    var parts = new List<string>();
-                    if (!string.IsNullOrEmpty(v.Args)) parts.Add(v.Args);
-                    if (!v.SupportsOptions && v.Target == GLeafPs1Path)
-                    {
-                        if (!_enableHud) parts.Add("-NoHud");
-                        if (_liteGraphics) parts.Add("-LowMemory");
-                    }
-                    if (v.SupportsOptions)
-                    {
-                        if (!_enableHud) parts.Add("-NoHud");
-                        if (!_unifiedMemory) parts.Add("-NoUnifiedMemory");
-                        if (_liteGraphics) parts.Add("-LiteGraphics");
-                        if (_mouseCamera)
-                        {
-                            parts.Add("-MouseCamera");
-                            parts.Add("-MouseSens " + _mouseSens.ToString("0.00", CultureInfo.InvariantCulture));
-                            if (_mouseInvertY) parts.Add("-MouseInvertY");
-                        }
-                        if (_mouseButtons != "off")
-                        {
-                            parts.Add("-MouseButtons " + _mouseButtons);
-                        }
-                        string km = SerializeCustomKeymap();
-                        if (!string.IsNullOrEmpty(km))
-                        {
-                            parts.Add("-Keymap \"" + km + "\"");
-                        }
-                    }
-                    string extra = string.Join(" ", parts.ToArray());
-
-                    var psi = new ProcessStartInfo
-                    {
-                        FileName = "powershell.exe",
-                        Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + v.Target + "\"" + (string.IsNullOrEmpty(extra) ? "" : " " + extra),
-                        WorkingDirectory = RepoDir,
-                        UseShellExecute = true
-                    };
-                    Process.Start(psi);
-                }
-                else
-                {
-                    LaunchFile(v.Target, v.Args);
-                }
-
-                if (_closeOnLaunch)
-                {
-                    Close();
-                }
-                else
-                {
-                    _statusText = "Iniciado: " + v.Title;
-                    TrimMemory();
-                    Invalidate();
-                }
-            }
-            catch (Exception ex)
-            {
-                _statusText = "Erro ao iniciar: " + ex.Message;
-                Invalidate();
-            }
-        }
-
-        private void LaunchFile(string path, string args)
-        {
-            if (!File.Exists(path))
-            {
-                _statusText = "Arquivo não encontrado: " + Path.GetFileName(path);
-                Invalidate();
-                return;
-            }
-            var psi = new ProcessStartInfo
-            {
-                FileName = path,
-                Arguments = args,
-                WorkingDirectory = Path.GetDirectoryName(path),
-                UseShellExecute = true
-            };
-            Process.Start(psi);
         }
 
         [STAThread]
