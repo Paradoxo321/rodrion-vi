@@ -2234,6 +2234,9 @@ struct Deferred {
     /// GPU->GPU copies recorded into this list's prelude:
     /// `(source_shadow, src_offset, dst_buffer, dst_offset, bytes)`.
     gpu_cbv_copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, ID3D12Resource, u64, u64)>,
+    /// Submit-time GPU->READBACK copies recorded into this list's prelude
+    /// (`VICTORY_COPY_ON_GPU_INFLIGHT=1`): `(source_shadow, src_offset, readback_buf, bytes)`.
+    gpu_readback_copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, ID3D12Resource, u64)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2894,6 +2897,149 @@ fn blocked_by_steps(written: &[(usize, usize)], steps: &[Step], count: bool) -> 
         }
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyDescKind {
+    Copy { dst: usize, src: usize, len: usize },
+    Fill { src: usize, len: usize },
+    Texture { at: usize, len: usize },
+    Refresh { addr: usize, len: usize },
+    GpuWrite { addr: usize, len: usize },
+    Run,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyDesc {
+    list_idx: usize,
+    step_idx: usize,
+    kind: CopyDescKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffloadDeclineReason {
+    DstHit,
+    DstShadowed,
+    LinearRbSrc,
+    TooLarge,
+    IntraHazard,
+    NoUniqueProducer,
+}
+
+impl OffloadDeclineReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DstHit => "dst_hit",
+            Self::DstShadowed => "dst_shadowed",
+            Self::LinearRbSrc => "linear_rb_src",
+            Self::TooLarge => "too_large",
+            Self::IntraHazard => "intra_hazard",
+            Self::NoUniqueProducer => "no_unique_producer",
+        }
+    }
+}
+
+#[inline]
+fn ranges_overlap(a0: usize, a_len: usize, b0: usize, b_len: usize) -> bool {
+    a_len > 0 && b_len > 0 && a0 < b0.saturating_add(b_len) && b0 < a0.saturating_add(a_len)
+}
+
+/// Plans submit-time GPU->READBACK offload for `Step::Copy` steps whose source
+/// touches `LINE.written`. Returns `(planned_steps, declined_reasons)`.
+#[allow(clippy::type_complexity)]
+fn plan_submit_copy_offload<P>(
+    written: &[(usize, usize)],
+    linear_rb_written: &[(usize, usize)],
+    copies: &[CopyDesc],
+    find_producer: impl Fn(usize, usize) -> Option<P>,
+    dst_shadowed: impl Fn(usize, usize) -> bool,
+) -> (Vec<(usize, usize, P)>, Vec<(usize, usize, usize, OffloadDeclineReason)>) {
+    let mut planned = Vec::new();
+    let mut declined = Vec::new();
+    if written.is_empty() {
+        return (planned, declined);
+    }
+    let has_run = copies.iter().any(|c| matches!(c.kind, CopyDescKind::Run));
+    for (i, desc) in copies.iter().enumerate() {
+        let CopyDescKind::Copy { dst, src, len } = desc.kind else {
+            continue;
+        };
+        let src_end = src.saturating_add(len);
+        let dst_end = dst.saturating_add(len);
+        if !touches(written, src, src_end) {
+            continue;
+        }
+        if len == 0 || len > (4 << 20) {
+            declined.push((dst, src, len, OffloadDeclineReason::TooLarge));
+            continue;
+        }
+        if touches(written, dst, dst_end) {
+            declined.push((dst, src, len, OffloadDeclineReason::DstHit));
+            continue;
+        }
+        if touches(linear_rb_written, src, src_end) {
+            declined.push((dst, src, len, OffloadDeclineReason::LinearRbSrc));
+            continue;
+        }
+        if has_run {
+            declined.push((dst, src, len, OffloadDeclineReason::IntraHazard));
+            continue;
+        }
+        let mut hazard = false;
+        for (j, other) in copies.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            match other.kind {
+                CopyDescKind::Copy { dst: d2, src: s2, len: l2 } => {
+                    if ranges_overlap(d2, l2, src, len) {
+                        hazard = true;
+                        break;
+                    }
+                    if j > i && (ranges_overlap(s2, l2, dst, len) || ranges_overlap(d2, l2, dst, len)) {
+                        hazard = true;
+                        break;
+                    }
+                }
+                CopyDescKind::Fill { src: s2, len: l2 } if j > i && ranges_overlap(s2, l2, dst, len) => {
+                    hazard = true;
+                    break;
+                }
+                CopyDescKind::Texture { at, len: l2 } if j > i && ranges_overlap(at, l2, dst, len) => {
+                    hazard = true;
+                    break;
+                }
+                CopyDescKind::Refresh { addr, len: l2 } if j > i && ranges_overlap(addr, l2, dst, len) => {
+                    hazard = true;
+                    break;
+                }
+                CopyDescKind::GpuWrite { addr, len: l2 }
+                    if other.list_idx == desc.list_idx
+                        && j < i
+                        && ranges_overlap(addr, l2, src, len) =>
+                {
+                    hazard = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if hazard {
+            declined.push((dst, src, len, OffloadDeclineReason::IntraHazard));
+            continue;
+        }
+        if dst_shadowed(dst, len) {
+            declined.push((dst, src, len, OffloadDeclineReason::DstShadowed));
+            continue;
+        }
+        let Some(producer) = find_producer(src, len) else {
+            declined.push((dst, src, len, OffloadDeclineReason::NoUniqueProducer));
+            continue;
+        };
+        planned.push((desc.list_idx, desc.step_idx, producer));
+    }
+    (planned, declined)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -5148,6 +5294,129 @@ impl Host {
         working(was_working);
     }
 
+    /// Submit-time offload (`VICTORY_COPY_ON_GPU_INFLIGHT=1`): converts `Step::Copy`
+    /// steps reading in-flight shader-written buffers (`LINE.written`) into GPU-side
+    /// `CopyBufferRegion` -> `READBACK` copies inside each list's prelude when safe,
+    /// avoiding a blocking `WHY_READ` settle.
+    fn offload_in_flight_copies(&self, runs: &[&HostList]) {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (written, flight_backs, linear_rb_written, settling) = {
+            let line = line();
+            if line.written.is_empty() {
+                return;
+            }
+            let written = line.written.clone();
+            let mut flight_backs: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+            let mut rb_raw: Vec<(usize, usize)> = Vec::new();
+            for item in &line.line {
+                if let Late::Run(flight) = item {
+                    for (shadow, ranges) in &flight.back {
+                        flight_backs.push((shadow.clone(), ranges.clone()));
+                    }
+                    rb_raw.extend(linear_readback_ranges(&flight.lists, &flight.order));
+                }
+            }
+            let mut linear_rb_written = Vec::new();
+            join_ranges(&mut linear_rb_written, rb_raw);
+            (written, flight_backs, linear_rb_written, line.settling)
+        };
+        let has_hit = runs.iter().any(|list| {
+            list.deferred().copies.iter().any(|step| match step {
+                &Step::Copy(_, src, len) => touches(&written, src, src.saturating_add(len)),
+                _ => false,
+            })
+        });
+        if !has_hit {
+            return;
+        }
+        let mut copies = Vec::new();
+        for (list_idx, list) in runs.iter().enumerate() {
+            for (step_idx, step) in list.deferred().copies.iter().enumerate() {
+                let kind = match step {
+                    &Step::Copy(dst, src, len) => CopyDescKind::Copy { dst, src, len },
+                    &Step::Fill(_, src, len) => CopyDescKind::Fill { src, len },
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        CopyDescKind::Texture { at, len }
+                    }
+                    &Step::Refresh(_, addr, len) => CopyDescKind::Refresh { addr, len },
+                    &Step::GpuWrite(_, addr, len) => CopyDescKind::GpuWrite { addr, len },
+                    Step::Run(_) => CopyDescKind::Run,
+                    Step::Host(_) => CopyDescKind::Other,
+                };
+                copies.push(CopyDesc { list_idx, step_idx, kind });
+            }
+        }
+        let find_producer = |src: usize, len: usize| -> Option<Arc<crate::shadow::Shadow>> {
+            let src_end = src.saturating_add(len);
+            let mut found: Option<&Arc<crate::shadow::Shadow>> = None;
+            for (shadow, ranges) in &flight_backs {
+                if ranges.iter().any(|&(a, b)| a < src_end && src < b) {
+                    match found {
+                        None => found = Some(shadow),
+                        Some(prev) if Arc::ptr_eq(prev, shadow) => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+            let shadow = found?;
+            let (s_start, s_len) = shadow.span();
+            if s_start <= src as u64 && s_start.saturating_add(s_len) >= src_end as u64 {
+                Some(shadow.clone())
+            } else {
+                None
+            }
+        };
+        let (planned, declined) = plan_submit_copy_offload(
+            &written,
+            &linear_rb_written,
+            &copies,
+            find_producer,
+            |dst, len| crate::shadow::find_existing(dst as u64, len as u64).is_some(),
+        );
+        for (dst, src, len, reason) in declined {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Relaxed) < 12 {
+                tracing::info!(
+                    src = format_args!("{src:#x}"),
+                    dst = format_args!("{dst:#x}"),
+                    len,
+                    reason = if settling && reason == OffloadDeclineReason::NoUniqueProducer {
+                        "relay_settling"
+                    } else {
+                        reason.as_str()
+                    },
+                    "COPY_ON_GPU_INFLIGHT declined submit-time offload"
+                );
+            }
+        }
+        // Iterate in reverse order so `Vec::remove(step_idx)` preserves earlier indices in each list.
+        for (list_idx, step_idx, src_shadow) in planned.into_iter().rev() {
+            let (dst, src, len) = match runs[list_idx].deferred().copies.get(step_idx) {
+                Some(&Step::Copy(dst, src, len)) => (dst, src, len),
+                _ => continue,
+            };
+            let Some(rb) = self.read_back_buffer(len as u64) else {
+                continue;
+            };
+            let mut deferred = runs[list_idx].deferred();
+            let Some(&Step::Copy(d2, s2, l2)) = deferred.copies.get(step_idx) else {
+                continue;
+            };
+            if (d2, s2, l2) != (dst, src, len) {
+                continue;
+            }
+            deferred.copies.remove(step_idx);
+            let src_off = src_shadow.offset(src as u64);
+            deferred.gpu_readback_copies.push((src_shadow, src_off, rb.clone(), len as u64));
+            deferred.backs.push((rb, dst, [len, 1, len]));
+            crate::list::COPY_ON_GPU_STATS[0].fetch_add(1, Relaxed);
+            crate::list::COPY_ON_GPU_STATS[1].fetch_add(len as u64, Relaxed);
+            crate::list::COPY_ON_GPU_STATS[3].fetch_add(1, Relaxed);
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -5167,13 +5436,18 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
-            } else {
-                self.settle(&mut submitted, why);
+        } else {
+            if crate::list::copy_on_gpu_inflight() {
+                self.offload_in_flight_copies(runs);
+            }
+            if let Some(why) = late_blocked(runs) {
+                if relay_exact() && why == WHY_READ {
+                    // Only until the flights that may write what is read have
+                    // landed: their copy-back's end, not the card's other work.
+                    relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                } else {
+                    self.settle(&mut submitted, why);
+                }
             }
         }
         // Descriptors the title copied into placed heaps directly, before
@@ -6169,6 +6443,7 @@ impl HostList {
         }));
         drop(states);
         let gpu_copies = self.deferred().gpu_cbv_copies.clone();
+        let gpu_rb_copies = self.deferred().gpu_readback_copies.clone();
         let mut copied_srcs: std::collections::HashMap<usize, ID3D12Resource> = std::collections::HashMap::new();
         let mut copied_dsts: std::collections::HashMap<usize, ID3D12Resource> = std::collections::HashMap::new();
         for (shadow, _, dst, _, _) in &gpu_copies {
@@ -6178,6 +6453,11 @@ impl HostList {
             copied_dsts
                 .entry(dst.as_raw() as usize)
                 .or_insert_with(|| dst.clone());
+        }
+        for (shadow, _, _, _) in &gpu_rb_copies {
+            copied_srcs
+                .entry(shadow.buffer.as_raw() as usize)
+                .or_insert_with(|| shadow.buffer.clone());
         }
         barriers.extend(
             self.buffers
@@ -6210,7 +6490,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_GENERIC_READ,
             ));
         }
-        if barriers.is_empty() && syncs.is_empty() && gpu_copies.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && gpu_copies.is_empty() && gpu_rb_copies.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6233,6 +6513,21 @@ impl HostList {
                 }
                 for (shadow, src_off, dst, dst_off, size) in &gpu_copies {
                     list.CopyBufferRegion(dst, *dst_off, &shadow.buffer, *src_off, *size);
+                }
+                if !gpu_rb_copies.is_empty() {
+                    // Ensure all prior GPU shader UAV writes to `shadow.buffer` are visible.
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    }]);
+                    for (shadow, src_off, rb, size) in &gpu_rb_copies {
+                        list.CopyBufferRegion(rb, 0, &shadow.buffer, *src_off, *size);
+                    }
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -8953,6 +9248,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn range_in_flight_written_detects_line_written_overlap() {
+        static LINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LINE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let src = 0x2acb_afe0usize;
         let len = 20480usize;
         let prev = {
@@ -8998,5 +9295,119 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             None,
             "GPU readback route must avoid WHY_READ blocking settle"
         );
+    }
+
+    #[test]
+    fn submit_copy_offload_plans_20480b_inplace_src_to_unshadowed_dst() {
+        use super::{CopyDesc, CopyDescKind, plan_submit_copy_offload};
+        let src = 0x289d_afe0usize;
+        let dst = 0x9_8be5_c460usize;
+        let len = 20480usize;
+        let written = vec![(src, src + len)];
+        let copies = [CopyDesc {
+            list_idx: 0,
+            step_idx: 0,
+            kind: CopyDescKind::Copy { dst, src, len },
+        }];
+        let (planned, declined) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &copies,
+            |a, l| (a == src && l == len).then_some(42usize),
+            |_, _| false,
+        );
+        assert!(declined.is_empty(), "expected no declined copy, got {declined:?}");
+        assert_eq!(
+            planned,
+            vec![(0, 0, 42usize)],
+            "submit-time planner must offload 20480B in-place src to unshadowed dst"
+        );
+    }
+
+    #[test]
+    fn submit_copy_offload_declines_on_hazards() {
+        use super::{CopyDesc, CopyDescKind, OffloadDeclineReason, plan_submit_copy_offload};
+        let src = 0x289d_afe0usize;
+        let dst = 0x9_8be5_c460usize;
+        let len = 20480usize;
+        let written = vec![(src, src + len)];
+        let base_copy = CopyDesc {
+            list_idx: 0,
+            step_idx: 0,
+            kind: CopyDescKind::Copy { dst, src, len },
+        };
+
+        // 1. dst overlaps LINE.written -> DstHit
+        let (p, d) = plan_submit_copy_offload(
+            &[(src, src + len), (dst, dst + 64)],
+            &[],
+            &[base_copy],
+            |_, _| Some(1usize),
+            |_, _| false,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::DstHit);
+
+        // 2. dst already shadowed -> DstShadowed
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[],
+            &[base_copy],
+            |_, _| Some(1usize),
+            |_, _| true,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::DstShadowed);
+
+        // 3. src overlaps linear readback -> LinearRbSrc
+        let (p, d) = plan_submit_copy_offload(
+            &written,
+            &[(src, src + 64)],
+            &[base_copy],
+            |_, _| Some(1usize),
+            |_, _| false,
+        );
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::LinearRbSrc);
+
+        // 4. len == 0 or > 4 MiB -> TooLarge
+        let big = [CopyDesc {
+            list_idx: 0,
+            step_idx: 0,
+            kind: CopyDescKind::Copy { dst, src, len: (4 << 20) + 1 },
+        }];
+        let (p, d) = plan_submit_copy_offload(&written, &[], &big, |_, _| Some(1usize), |_, _| false);
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::TooLarge);
+
+        // 5. Intra-submission hazards: later Step::Fill/Texture/Refresh reading dst, Step::Copy writing src, or Step::Run
+        let with_later_fill = [
+            base_copy,
+            CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Fill { src: dst, len: 64 } },
+        ];
+        let (p, d) = plan_submit_copy_offload(&written, &[], &with_later_fill, |_, _| Some(1usize), |_, _| false);
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+
+        let with_src_write = [
+            CopyDesc { list_idx: 0, step_idx: 0, kind: CopyDescKind::Copy { dst: src, src: 0x5000_0000, len: 64 } },
+            CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Copy { dst, src, len } },
+        ];
+        let (p, d) = plan_submit_copy_offload(&written, &[], &with_src_write, |_, _| Some(1usize), |_, _| false);
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+
+        let with_run = [
+            base_copy,
+            CopyDesc { list_idx: 0, step_idx: 1, kind: CopyDescKind::Run },
+        ];
+        let (p, d) = plan_submit_copy_offload(&written, &[], &with_run, |_, _| Some(1usize), |_, _| false);
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::IntraHazard);
+
+        // 6. No unique producer -> NoUniqueProducer
+        let (p, d) = plan_submit_copy_offload(&written, &[], &[base_copy], |_, _| None::<usize>, |_, _| false);
+        assert!(p.is_empty());
+        assert_eq!(d[0].3, OffloadDeclineReason::NoUniqueProducer);
     }
 }
