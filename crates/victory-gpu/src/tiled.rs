@@ -356,6 +356,15 @@ impl TiledBacking {
         self.bias
     }
 
+    pub(crate) fn needs_sync(&self) -> bool {
+        let last = self.map_gen.load(Ordering::Acquire);
+        let end = self.base.saturating_add(self.n_tiles * K64);
+        matches!(
+            crate::inplace::range_changed_since(last, self.base, end),
+            crate::inplace::RangeSync::Rescan
+        )
+    }
+
     /// Returns a pointer inside the tile holding byte offset `at` (from
     /// `Shadow::start`), or `None` if that tile is an unmapped `NULL` hole.
     /// Safe for any stretch staying within a single 64 KiB aligned piece

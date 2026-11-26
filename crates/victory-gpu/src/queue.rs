@@ -1201,9 +1201,50 @@ extern "system" fn present(
     S_OK
 }
 
+/// (KLBF Lab 63 / WillyboPeep) `VICTORY_PIPELINES_FIRST` (on by default; `0`: off):
+/// while the title shows its start and loading screens (< 64 draws/frame) and host
+/// pipelines are still being made, holds present up to 1.5 s at a time so pipelines
+/// finish before the world opens.
+#[cfg(windows)]
+fn hold_for_pipelines() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINES_FIRST").is_none_or(|v| v != "0")) {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    let last = LAST.swap(drawn, Ordering::Relaxed);
+    let frame = if drawn >= last { drawn - last } else { drawn };
+    if frame >= 64 || crate::pipeline::making() == 0 {
+        return;
+    }
+    static HELD_MS: AtomicU64 = AtomicU64::new(0);
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    const MOST_MS: u64 = 300_000;
+    if HELD_MS.load(Ordering::Relaxed) >= MOST_MS {
+        return;
+    }
+    if SAID.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::info!(
+            waiting = crate::pipeline::making(),
+            "presents of start/loading screens wait while host pipelines are made (VICTORY_PIPELINES_FIRST=0: off)"
+        );
+    }
+    let began = std::time::Instant::now();
+    while crate::pipeline::making() > 0 && began.elapsed() < std::time::Duration::from_millis(1500) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let elapsed = began.elapsed().as_millis() as u64;
+    let total = HELD_MS.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
+    if crate::pipeline::making() == 0 && SAID.compare_exchange(1, 2, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::info!(seconds = total / 1000, "host pipelines are made: loading presents wait no longer");
+    }
+}
+
 /// [`present`], when its turn has come.
 #[cfg(windows)]
 fn present_now(snapshot: Vec<PresentLayer>) {
+    hold_for_pipelines();
     #[cfg(feature = "diagnostics")]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,

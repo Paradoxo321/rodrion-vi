@@ -139,6 +139,14 @@ pub(crate) struct HostHeap {
     placed: std::sync::Arc<Mutex<Spans>>,
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if !self.sampler {
+            crate::memory::forget_heap(self);
+        }
+    }
+}
+
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
 /// texture code, which has no heap at hand ([`next_start`],
 /// [`first_viewed`]).

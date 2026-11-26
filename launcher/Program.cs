@@ -411,7 +411,10 @@ namespace VictoryLauncher
         private const string DataDir = @"C:\Users\gabri\Downloads\victory-data";
         private const string ConfigPath = @"C:\Users\gabri\Downloads\victory-data\launcher-config.ini";
         private const string Ps1Path = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-klbf-lab39.ps1";
+        private const string GLeafPs1Path = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-gleaf-ka1qux.ps1";
+        private const string GLeafExePath = @"C:\Users\gabri\Downloads\victory-gleaf6\target\release\victory.exe";
         private const string PrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-KLBF-Lab39-AMD.bat";
+        private const string GLeafPrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-GLeaf-Ka1qux-AMD.bat";
 
         private static readonly Color BgWindow = Color.FromArgb(14, 16, 22);
         private static readonly Color BgCard = Color.FromArgb(22, 26, 36);
@@ -671,12 +674,39 @@ namespace VictoryLauncher
         private void LoadVersions()
         {
             bool ps1Ok = File.Exists(Ps1Path) && File.Exists(Path.Combine(RepoDir, "target", "release", "victory.exe"));
+            bool gleafOk = File.Exists(GLeafPs1Path) && File.Exists(GLeafExePath);
 
             _versions.Add(new GameVersion
             {
-                Title = "Unificado FPS MAX — FSR 2.4 (720p)",
-                Subtitle = "UMA + Tiled Physical Pool + KLBF 39 + LATE_WAIT=3 + Batch Paralelo",
-                Badge = "RECOMENDADO",
+                Title = "GLeaf-6 + Shaders Ka1qux + Lab 63 — FSR + FG (720p)",
+                Subtitle = "GLeaf + Ka1qux + Lab 63 (Cap 1024/512px, Skip Intro, PBR/Hair, CBV Fix)",
+                Badge = "GLEAF+L63",
+                BadgeColor = AccentPink,
+                Kind = "ps1",
+                Target = GLeafPs1Path,
+                Args = "-FrameGen -Res720p",
+                SupportsOptions = false,
+                Available = gleafOk
+            });
+
+            _versions.Add(new GameVersion
+            {
+                Title = "GLeaf-6 + Shaders Ka1qux + Lab 63 — FSR sem FG (720p)",
+                Subtitle = "GLeaf + Ka1qux + Lab 63 (PBR/Hair, Skip Intro, 768k Slots) • Sem FrameGen",
+                Badge = "GLEAF FSR",
+                BadgeColor = AccentBlue,
+                Kind = "ps1",
+                Target = GLeafPs1Path,
+                Args = "-Res720p",
+                SupportsOptions = false,
+                Available = gleafOk
+            });
+
+            _versions.Add(new GameVersion
+            {
+                Title = "Tiled Pool (16 GB RAM) + Lab 63 — FSR 2.4 (720p)",
+                Subtitle = "Tiled Pool (-51% RAM) + Section Views 36x + Cap 1024/512px + LRU + Skip Intro",
+                Badge = "TILED+L63",
                 BadgeColor = AccentCyan,
                 Kind = "ps1",
                 Target = Ps1Path,
@@ -687,20 +717,20 @@ namespace VictoryLauncher
 
             _versions.Add(new GameVersion
             {
-                Title = "Unificado FPS MAX — FSR 2.4 (1080p)",
-                Subtitle = "Full HD nativo com AMD FSR 2.4 • Água KLBF 39 + 524k slots AMD",
-                Badge = "1080p FSR",
+                Title = "Tiled Pool (16 GB RAM) — FSR + FrameGen (720p)",
+                Subtitle = "Tiled Pool (-51% RAM) + Geração de Quadros AMD • Estável em 16 GB",
+                Badge = "TILED + FG",
                 BadgeColor = AccentGreen,
                 Kind = "ps1",
                 Target = Ps1Path,
-                Args = "",
+                Args = "-FrameGen -Res720p",
                 SupportsOptions = true,
                 Available = ps1Ok
             });
 
             _versions.Add(new GameVersion
             {
-                Title = "Unificado FPS MAX — Simple (720p)",
+                Title = "Tiled Pool (16 GB RAM) — Simple (720p)",
                 Subtitle = "Upscaler bilinear ultraleve sem FSR • Menor consumo de VRAM e RAM",
                 Badge = "MAIS LEVE",
                 BadgeColor = AccentGreen,
@@ -713,33 +743,20 @@ namespace VictoryLauncher
 
             _versions.Add(new GameVersion
             {
-                Title = "Unificado FPS MAX — Simple (1080p)",
-                Subtitle = "Full HD com upscaler bilinear simples • Estável e sem overhead de FSR",
-                Badge = "1080p",
+                Title = "Tiled Pool (16 GB RAM) — FSR 2.4 (1080p)",
+                Subtitle = "Full HD nativo com AMD FSR 2.4 • Água KLBF 39 + 524k slots AMD",
+                Badge = "1080p FSR",
                 BadgeColor = AccentSlate,
                 Kind = "ps1",
                 Target = Ps1Path,
-                Args = "-SimpleUpscale",
+                Args = "",
                 SupportsOptions = true,
                 Available = ps1Ok
             });
 
             _versions.Add(new GameVersion
             {
-                Title = "Unificado — FSR 2.4 + FrameGen (720p)",
-                Subtitle = "Geração de quadros AMD (+500 MB VRAM) • Experimental no mundo aberto",
-                Badge = "FRAMEGEN",
-                BadgeColor = AccentPink,
-                Kind = "ps1",
-                Target = Ps1Path,
-                Args = "-FrameGen -Res720p",
-                SupportsOptions = true,
-                Available = ps1Ok
-            });
-
-            _versions.Add(new GameVersion
-            {
-                Title = "Unificado — Modo Seguro (720p)",
+                Title = "Tiled Pool — Modo Seguro (720p)",
                 Subtitle = "Sem flags agressivas (LATE_WAIT=1, CopyPlain=0) • Máxima estabilidade",
                 Badge = "SEGURO",
                 BadgeColor = AccentAmber,
@@ -749,23 +766,6 @@ namespace VictoryLauncher
                 SupportsOptions = true,
                 Available = ps1Ok
             });
-
-            string backupBat = Path.Combine(GameDir, "Jogar-GTA6-RX6600-Otimizado-HUD.bat");
-            if (File.Exists(backupBat))
-            {
-                _versions.Add(new GameVersion
-                {
-                    Title = "RX 6600 Original (Backup)",
-                    Subtitle = "Build anterior intacta • Jogar-GTA6-RX6600-Otimizado-HUD.bat",
-                    Badge = "BACKUP",
-                    BadgeColor = AccentSlate,
-                    Kind = "bat",
-                    Target = backupBat,
-                    Args = "",
-                    SupportsOptions = false,
-                    Available = true
-                });
-            }
         }
 
         private void ComputeLayout()
@@ -1240,7 +1240,8 @@ namespace VictoryLauncher
             }
             else if (_precompileRect.Contains(e.Location))
             {
-                LaunchFile(PrecompileBat, "");
+                bool isGLeaf = _selectedIndex >= 0 && _selectedIndex < _versions.Count && _versions[_selectedIndex].Target == GLeafPs1Path;
+                LaunchFile(isGLeaf ? GLeafPrecompileBat : PrecompileBat, "");
             }
             else if (_logsRect.Contains(e.Location))
             {
@@ -1334,6 +1335,11 @@ namespace VictoryLauncher
                 {
                     var parts = new List<string>();
                     if (!string.IsNullOrEmpty(v.Args)) parts.Add(v.Args);
+                    if (!v.SupportsOptions && v.Target == GLeafPs1Path)
+                    {
+                        if (!_enableHud) parts.Add("-NoHud");
+                        if (_liteGraphics) parts.Add("-LowMemory");
+                    }
                     if (v.SupportsOptions)
                     {
                         if (!_enableHud) parts.Add("-NoHud");

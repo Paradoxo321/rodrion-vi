@@ -1372,11 +1372,47 @@ fn is_block_compressed(format: u32) -> bool {
     matches!(pc_format(format), 70..=84 | 94..=99)
 }
 
+/// (KLBF Lab 63 / Evan Lowry) Largest side in texels of a sampled placed BC
+/// texture on the host (`VICTORY_TEXTURE_MAX_DIM`, 4..=16384; 0 or unset: off).
+#[cfg(windows)]
+fn texture_max_dim() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_TEXTURE_MAX_DIM").ok()?;
+        match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n @ 4..=16384) => {
+                tracing::info!(max_dim = n, "limiting host size of sampled BC textures (VICTORY_TEXTURE_MAX_DIM)");
+                Some(n)
+            }
+            _ => {
+                tracing::warn!(value, "VICTORY_TEXTURE_MAX_DIM expects 0 or 4..=16384");
+                None
+            }
+        }
+    })
+}
+
+/// (KLBF Lab 63) Keep loading screens, menus and short-mip images at full size
+/// under `VICTORY_TEXTURE_MAX_DIM` (`VICTORY_TEXTURE_MAX_DIM_KEEP_UI=0` to disable).
+#[cfg(windows)]
+fn keep_ui() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_MAX_DIM_KEEP_UI").is_none_or(|v| v != "0"))
+}
+
+/// Flat screen images (loading screens, menus): non-power-of-two side or short mip chain.
+fn looks_like_ui(desc: &ResourceDesc) -> bool {
+    let (w, h) = (desc.width, u64::from(desc.height));
+    let full = u64::from(64 - w.min(h).max(1).leading_zeros());
+    !w.is_power_of_two() || !h.is_power_of_two() || desc.mip_levels <= 3 || u64::from(desc.mip_levels) + 2 < full
+}
+
 /// How many of its largest mips a host copy of a texture described by
-/// `desc` leaves out: `VICTORY_TEXTURE_DROP_MIPS` (0 to 4, on block-compressed
-/// 3D world 2D textures with full mip chains `>= 6`, keeping loading screens,
-/// splash artwork, 16:9 screens and UI textures crisp at native resolution)
-/// and those past [`short_side`] when made short of room ([`ShortOfRoom`]).
+/// `desc` leaves out: `VICTORY_TEXTURE_MAX_DIM` (Lab 63), `VICTORY_TEXTURE_DROP_MIPS`
+/// (0 to 4), and those past [`short_side`] when made short of room ([`ShortOfRoom`]).
+/// Loading screens, splash artwork, 16:9 screens, short-mip UI and non-BC textures
+/// are kept crisp at native resolution.
 #[cfg(windows)]
 fn drop_levels(desc: &ResourceDesc) -> u32 {
     const TEXTURE_2D: u32 = 3;
@@ -1389,25 +1425,35 @@ fn drop_levels(desc: &ResourceDesc) -> u32 {
             .min(4)
     });
     let (width, height) = (desc.width, u64::from(desc.height));
-    // Protect loading screens, splash artwork, HUD/UI and non-BC textures
-    // from mip dropping: 3D world textures are BC1-BC7 with full mip chains
-    // (>= 6 levels) and not 16:9 fullscreen dimensions (1280x720, 1920x1080...).
     let is_screen_16_9 = width * 9 == height * 16;
     if !fills(desc)
         || desc.dimension != TEXTURE_2D
         || desc.depth_or_array_size != 1
         || desc.sample_count > 1
-        || desc.mip_levels < 6
-        || is_screen_16_9
+        || desc.mip_levels <= 1
         || !is_block_compressed(desc.format)
     {
         return 0;
     }
-    let mut n = if always > 0 && width.min(height) >= 512 { always } else { 0 };
-    if SHORT.get() {
-        let side = short_side();
-        while width.max(height) >> n > side {
-            n += 1;
+    let mut n = 0u32;
+    if let Some(limit) = texture_max_dim()
+        && !(keep_ui() && looks_like_ui(desc))
+    {
+        let mut cap_n = 0u32;
+        while width.max(height) >> cap_n > limit && cap_n + 1 < u32::from(desc.mip_levels) {
+            cap_n += 1;
+        }
+        n = n.max(cap_n);
+    }
+    if desc.mip_levels >= 6 && !is_screen_16_9 {
+        if always > 0 && width.min(height) >= 512 {
+            n = n.max(always);
+        }
+        if SHORT.get() {
+            let side = short_side();
+            while width.max(height) >> n > side {
+                n += 1;
+            }
         }
     }
     levels_to_drop(n, width, height, u32::from(desc.mip_levels))
@@ -1990,20 +2036,50 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(
-        crate::host::host()
-            .and_then(|h| h.video_memory())
-            .map(|[budget, used, a, b]| [budget, used.saturating_sub(HEAP_FREE.load(Relaxed)), a, b]),
-    );
+    let video = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map(|[budget, used, a, b]| [budget, used.saturating_sub(HEAP_FREE.load(Relaxed)), a, b]);
+    let idle_ms = crate::host::vram_idle_ms(video);
+    // (KLBF Lab 63 / samishating) `VICTORY_TEXTURE_LRU=1`: idle copies go
+    // oldest first, only enough bytes to bring VRAM under `VICTORY_TEXTURE_KEEP_PERCENT`
+    // of budget (default: room_percent - 5%), plus any copy idle for 30 s.
+    const LONG_MS: u64 = 30_000;
+    static LRU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lru = *LRU.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_some_and(|v| v == "1"));
+    static KEEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_KEEP_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(room_percent().saturating_sub(5), |p| p.clamp(40, room_percent()))
+    });
+    let mut over = match video {
+        Some([budget, used, ..]) if lru => used.saturating_sub(budget / 100 * keep),
+        _ => u64::MAX,
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
+    let mut order: Vec<(u64, usize)> = all
+        .iter()
+        .map(|&at| {
+            // SAFETY: as below.
+            let r = unsafe { &*(at as *const Resource) };
+            (r.host.used.load(Relaxed), at)
+        })
+        .collect();
+    if lru {
+        order.sort_unstable_by_key(|&(used, _)| used);
+    }
+    for &(_, at) in order.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        if over == 0 && !crate::host::long_ago(r.host.used.load(Relaxed), LONG_MS, IDLE_FRAMES) {
             continue;
         }
         let gone = {
@@ -2028,6 +2104,7 @@ pub(crate) fn let_go_idle() {
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
             bytes += host.bytes;
+            over = over.saturating_sub(host.bytes);
             if first.is_none() {
                 first = Some(at);
             }

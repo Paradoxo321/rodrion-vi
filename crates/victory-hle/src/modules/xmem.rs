@@ -362,7 +362,19 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE, bool);
+/// (KLBF Lab 63 / WillyboPeep) Standing view of a whole physical-page section
+/// plus per-page committed bitmap (`VICTORY_SECTION_VIEWS=1`, on by default).
+/// Avoids MapViewOfFile + VirtualAlloc + UnmapViewOfFile (global TLB shootdown)
+/// on every DirectStorage streaming write.
+struct Whole {
+    size: usize,
+    base: std::sync::atomic::AtomicUsize,
+    committed: Box<[std::sync::atomic::AtomicU64]>,
+}
+
+const WHOLE_REFUSED: usize = 1;
+
+struct Section(HANDLE, bool, Whole);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -371,9 +383,100 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        let base = *self.2.base.get_mut();
+        if base != 0 && base != WHOLE_REFUSED {
+            // SAFETY: our own standing view of the whole section; no slices remain.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
+        }
         victory_gpu::title_memory_section_gone(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn section_views_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SECTION_VIEWS").is_none_or(|v| v != "0"))
+}
+
+impl Section {
+    fn new(handle: HANDLE, section_committed: bool, size: usize) -> Self {
+        let words = size.div_ceil(PAGE).div_ceil(64);
+        let init = if section_committed || on_wine() { u64::MAX } else { 0 };
+        Section(
+            handle,
+            section_committed,
+            Whole {
+                size,
+                base: std::sync::atomic::AtomicUsize::new(0),
+                committed: (0..words).map(|_| std::sync::atomic::AtomicU64::new(init)).collect(),
+            },
+        )
+    }
+
+    fn is_committed(&self, index: usize, n: usize) -> bool {
+        if self.1 || on_wine() {
+            return true;
+        }
+        (index..index + n).all(|p| {
+            self.2
+                .committed
+                .get(p / 64)
+                .is_some_and(|w| w.load(Ordering::Acquire) & (1 << (p % 64)) != 0)
+        })
+    }
+
+    fn mark_committed(&self, index: usize, n: usize) {
+        for p in index..index + n {
+            if let Some(word) = self.2.committed.get(p / 64) {
+                word.fetch_or(1 << (p % 64), Ordering::Release);
+            }
+        }
+    }
+
+    fn whole(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        match self.2.base.load(Ordering::Acquire) {
+            0 => {}
+            WHOLE_REFUSED => return None,
+            base => return Some(base),
+        }
+        // SAFETY: standing view of a section we own until Section::drop.
+        let at = unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, 0) };
+        let made = if at.Value.is_null() {
+            WHOLE_REFUSED
+        } else {
+            at.Value as usize
+        };
+        match self.2.base.compare_exchange(0, made, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => (made != WHOLE_REFUSED).then_some(made),
+            Err(theirs) => {
+                if made != WHOLE_REFUSED {
+                    // SAFETY: redundant view nobody used.
+                    unsafe { UnmapViewOfFile(at) };
+                }
+                (theirs != WHOLE_REFUSED).then_some(theirs)
+            }
+        }
+    }
+
+    fn standing(&self, index: usize, n: usize) -> Option<*mut u8> {
+        if !section_views_on() {
+            return None;
+        }
+        let (offset, len) = (index.checked_mul(PAGE)?, n.checked_mul(PAGE)?);
+        if offset.checked_add(len)? > self.2.size {
+            return None;
+        }
+        let base = self.whole()?;
+        if !self.is_committed(index, n) {
+            if !commit(base + offset, len, self.1) {
+                return None;
+            }
+            self.mark_committed(index, n);
+        }
+        Some((base + offset) as *mut u8)
     }
 }
 
@@ -765,7 +868,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             return 0;
         }
         victory_gpu::title_memory_section(handle as usize, chunk_bytes as u64, committed);
-        chunks.push((Arc::new(Section(handle, committed)), take));
+        chunks.push((Arc::new(Section::new(handle, committed, chunk_bytes)), take));
         left -= take;
     }
     tracing::debug!(
@@ -848,7 +951,11 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len, slice.section.1).then_some(view)
+        if !commit(at.Value as usize, len, slice.section.1) {
+            return None;
+        }
+        slice.section.mark_committed(slice.index, n);
+        Some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -943,8 +1050,21 @@ impl PageRuns {
                 }
             }
         }
+        if let Some(at) = slice.section.standing(slice.index, *n) {
+            return Some(PageWindow {
+                _view: None,
+                _section: Some(slice.section.clone()),
+                at,
+                within: self.within,
+                len: self.len,
+            });
+        }
+        let mut view = View::map(slice, *n)?;
+        let at = view.bytes().as_mut_ptr();
         Some(PageWindow {
-            view: View::map(slice, *n)?,
+            _view: Some(view),
+            _section: None,
+            at,
             within: self.within,
             len: self.len,
         })
@@ -989,11 +1109,22 @@ impl PageRuns {
                 !p.private_at.is_empty() && (0..*n).any(|k| p.private_at.contains_key(&slice.key(k)))
             };
             if !has_private {
-                let Some(mut view) = View::map(slice, *n) else {
-                    return false;
-                };
                 let k = (n * PAGE - within).min(data.len() - done);
-                view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+                if let Some(at) = slice.section.standing(slice.index, *n) {
+                    // SAFETY: standing view of `n` committed pages in `slice.section`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().add(done),
+                            at.add(within),
+                            k,
+                        );
+                    }
+                } else {
+                    let Some(mut view) = View::map(slice, *n) else {
+                        return false;
+                    };
+                    view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+                }
                 if uma_pool() {
                     let mut p = physical();
                     for idx in 0..*n {
@@ -1044,15 +1175,17 @@ impl PageRuns {
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
+    _view: Option<View>,
+    _section: Option<Arc<Section>>,
+    at: *mut u8,
     within: usize,
     len: usize,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        // SAFETY: `at` points to committed pages kept alive by `_view` or `_section`.
+        unsafe { std::slice::from_raw_parts_mut(self.at.add(self.within), self.len) }
     }
 }
 
@@ -1671,10 +1804,13 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len, slice.section.1) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    if !(section_views_on() && slice.section.is_committed(slice.index, len / PAGE)) {
+        if !commit(base, len, slice.section.1) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
+        slice.section.mark_committed(slice.index, len / PAGE);
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);

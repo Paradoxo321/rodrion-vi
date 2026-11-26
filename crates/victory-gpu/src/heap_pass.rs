@@ -20,6 +20,36 @@
 //! passes, all spans every pass) to compare.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Fast non-cryptographic hasher for integer slot/copy keys (~200k ops/frame
+/// in `Picked::plan`/`forget`/`keep`), replacing SipHash.
+#[derive(Default)]
+struct SlotHash(u64);
+
+impl Hasher for SlotHash {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_usize(usize::from(b));
+        }
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        let h = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.write_usize(n as usize);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<SlotHash>>;
+type FastSet<K> = HashSet<K, BuildHasherDefault<SlotHash>>;
 
 /// Passes between two looks at every slot, besides those marked.
 pub(crate) const FULL_EVERY: u64 = 256;
@@ -49,7 +79,7 @@ struct Slot {
 
 struct Copy<C> {
     copy: C,
-    slots: HashSet<u32>,
+    slots: FastSet<u32>,
     from: u64,
     to: u64,
     /// A slot went: the span is worked out again from those left.
@@ -72,13 +102,13 @@ pub(crate) fn scan_every() -> u64 {
 /// What a pass looks at (see the module).
 pub(crate) struct Picked<C> {
     passes: u64,
-    slots: HashMap<u32, Slot>,
-    copies: HashMap<usize, Copy<C>>,
+    slots: FastMap<u32, Slot>,
+    copies: FastMap<usize, Copy<C>>,
     /// Slots that found no host copy, with the record seen.
-    orphans: HashMap<u32, Record>,
+    orphans: FastMap<u32, Record>,
     /// View table entry -> slots whose record named it at their last look
     /// (some may name another by now: checked when used).
-    by_entry: HashMap<u32, Vec<u32>>,
+    by_entry: FastMap<u32, Vec<u32>>,
     /// Table entries freed since the last pass; `None`: not known.
     forgotten: Option<Vec<u32>>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
@@ -95,10 +125,10 @@ impl<C: Clone> Picked<C> {
     pub(crate) fn with_scan_every(full: bool, scan_every: u64) -> Self {
         Picked {
             passes: 0,
-            slots: HashMap::new(),
-            copies: HashMap::new(),
-            orphans: HashMap::new(),
-            by_entry: HashMap::new(),
+            slots: FastMap::default(),
+            copies: FastMap::default(),
+            orphans: FastMap::default(),
+            by_entry: FastMap::default(),
             forgotten: None,
             full,
             scan_every: scan_every.max(1),
@@ -146,7 +176,7 @@ impl<C: Clone> Picked<C> {
             self.clear();
             return all();
         }
-        let mut due: HashSet<u32> = changed.into_iter().collect();
+        let mut due: FastSet<u32> = changed.into_iter().collect();
         for e in forgotten {
             if let Some(slots) = self.by_entry.remove(&e) {
                 // Only those whose record still names the entry.
@@ -224,7 +254,7 @@ impl<C: Clone> Picked<C> {
         self.slots.insert(slot, Slot { copy: key, from, to, record, unordered });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
-            slots: HashSet::new(),
+            slots: FastSet::default(),
             from,
             to,
             stale: false,

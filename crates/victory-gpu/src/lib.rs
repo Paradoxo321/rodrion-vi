@@ -65,6 +65,8 @@ mod ranges;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod stamp;
+#[cfg(windows)]
 mod tiled;
 #[cfg(windows)]
 mod tiles;

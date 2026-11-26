@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+pub(crate) mod aside;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -882,6 +884,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Asynchronous heap-buffer refreshes running on `victory-aside` while the
+    /// title records the rest of this list (`cool_fox` `aside.rs`).
+    coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
     /// Mesh arguments being clamped together in this recording (`shadowdog00 31634e42`).
     mesh_batch: Mutex<Option<crate::indirect::MeshBatch>>,
     /// Counts the list in [`ALIVE`] while it lives.
@@ -2153,6 +2158,36 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// Fast non-cryptographic hasher for integer/address keys in hot per-list
+/// lookup tables (`Deferred`, `State`), replacing SipHash.
+#[derive(Default)]
+pub(crate) struct AddressHash(u64);
+
+impl std::hash::Hasher for AddressHash {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_usize(usize::from(b));
+        }
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        let h = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.write_usize(n as usize);
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.write_usize(n as usize);
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -2168,19 +2203,19 @@ struct Deferred {
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
     /// Pipelines [`HostList::bind_pipeline`] already kept/noted in this list.
-    bound: std::collections::HashSet<usize>,
+    bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges declared written by shaders since the last write to title
     /// memory (host copy, address, bytes): declaring again changes nothing.
-    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Scratch memory [`HostList::fill_scratch`] filled since the list last
     /// wrote title memory (source, bytes): its host GPU address.
-    filled: std::collections::HashMap<(usize, usize), u64>,
+    filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// GPU-side aligned CBV copies (`VICTORY_GPU_CBV=1`): cached per
     /// `(source_addr, bytes)` until the list writes title memory.
-    filled_gpu: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64)>,
+    filled_gpu: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64), std::hash::BuildHasherDefault<AddressHash>>,
     /// VRAM DEFAULT chunks owned by this list for unaligned CBV copies.
     gpu_cbv_chunks: Vec<(GpuChunk, u64)>,
     /// Bytes allocated in the last chunk of `gpu_cbv_chunks`.
@@ -2189,7 +2224,7 @@ struct Deferred {
     /// `(source_shadow, src_offset, dst_buffer, dst_offset, bytes)`.
     gpu_cbv_copies: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, ID3D12Resource, u64, u64)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3610,6 +3645,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                coming: Mutex::default(),
                 mesh_batch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
@@ -3928,14 +3964,24 @@ impl Host {
                         for (shadow, before, size, ranges) in to_hash {
                             list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                             list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let joins = rehash_runs();
                             let runs: Vec<crate::shadow::CardSpan> =
                                 if whole.iter().any(|s| std::ptr::eq(Arc::as_ptr(s), shadow)) {
                                     vec![shadow.card_run(0, usize::MAX)]
                                 } else {
-                                    ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                                    let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
+                                    for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                                        match runs.last_mut() {
+                                            Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => {
+                                                last.to = last.to.max(run.to);
+                                            }
+                                            _ => runs.push(run),
+                                        }
+                                    }
+                                    runs
                                 };
                             // The same pieces in fewer passes (`rehash_runs`).
-                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                             for run in runs {
@@ -5065,6 +5111,7 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        crate::stamp::advance();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -5571,6 +5618,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.take_coming();
         self.end_mesh_batch();
         self.twins_to_depth();
         self.textures_back();
@@ -5622,9 +5670,38 @@ impl HostList {
         }
     }
 
+    /// Runs `work` on the dedicated `victory-aside` thread to find buffer
+    /// refreshes belonging at this point in the list's deferred steps; they
+    /// are spliced in at `close()` (`cool_fox` `aside.rs`).
+    pub(crate) fn refreshes_coming(
+        &self,
+        work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static,
+    ) {
+        self.take_coming();
+        let at = self.deferred().copies.len();
+        let coming = aside::begin(work);
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+    }
+
+    fn take_coming(&self) {
+        let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let found = coming.wait();
+        let mut deferred = self.deferred();
+        let at = at.min(deferred.copies.len());
+        deferred.copies.splice(
+            at..at,
+            found
+                .into_iter()
+                .map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)),
+        );
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.take_coming();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
@@ -6626,6 +6703,14 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if shadow.current(address, len) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
@@ -6901,6 +6986,11 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_now(dst, src, len);
+    crate::stamp::advance();
+}
+
+fn write_mapped_now(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();

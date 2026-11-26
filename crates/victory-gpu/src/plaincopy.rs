@@ -56,6 +56,43 @@ core::arch::global_asm!(
     "    mov rdi, r10",
     "    xor eax, eax",
     "    ret",
+
+    ".globl victory_safe_put",
+    ".globl victory_safe_put_at",
+    ".globl victory_safe_put_after",
+    ".globl victory_safe_put_failed",
+    // rcx destination, rdx what was there, r8 what is to be there, r9 blocks
+    // of eight dwords (32 bytes): stores only the dwords in which `now` differs
+    // from `was` using AVX2 `vpmaskmovd` (cool_fox safecopy.rs).
+    "victory_safe_put:",
+    "    test r9, r9",
+    "    jz 4f",
+    "    vpcmpeqd ymm3, ymm3, ymm3",
+    "2:",
+    "    vmovdqu ymm1, ymmword ptr [r8]",
+    "    vpcmpeqd ymm2, ymm1, ymmword ptr [rdx]",
+    "    vmovmskps eax, ymm2",
+    "    cmp eax, 255",
+    "    je 3f",
+    "    vpxor ymm2, ymm2, ymm3",
+    "victory_safe_put_at:",
+    "    vpmaskmovd ymmword ptr [rcx], ymm2, ymm1",
+    "victory_safe_put_after:",
+    "    nop",
+    "3:",
+    "    add rcx, 32",
+    "    add rdx, 32",
+    "    add r8, 32",
+    "    dec r9",
+    "    jnz 2b",
+    "    vzeroupper",
+    "4:",
+    "    mov eax, 1",
+    "    ret",
+    "victory_safe_put_failed:",
+    "    vzeroupper",
+    "    xor eax, eax",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -67,6 +104,11 @@ unsafe extern "C" {
     fn victory_write_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_write_guarded_at: u8;
     static victory_write_guarded_fault: u8;
+
+    fn victory_safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    static victory_safe_put_at: u8;
+    static victory_safe_put_after: u8;
+    static victory_safe_put_failed: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
@@ -177,6 +219,17 @@ fn install() {
                 context.Rip = (&raw const victory_write_guarded_fault) as u64;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+        } else if rip >= (&raw const victory_safe_put_at) as u64
+            && rip < (&raw const victory_safe_put_after) as u64
+        {
+            let write = r.NumberParameters >= 1 && r.ExceptionInformation[0] == WRITE;
+            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+                || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR)
+                && write;
+            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
+                context.Rip = (&raw const victory_safe_put_failed) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
         EXCEPTION_CONTINUE_SEARCH
     }
@@ -253,6 +306,77 @@ pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
         note_fault_in(&WRECENT, to as usize, len);
     }
     whole
+}
+
+/// Whether AVX2 masked dword diff-writes (`put_changed`) are available and on.
+pub(crate) fn put_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
+        avx2 && write_on()
+    })
+}
+
+/// Writes `now` to `dst` ONLY where it differs from `was` (whole dwords via
+/// AVX2 `vpmaskmovd`, 32 bytes/cycle, without touching unchanged cache lines
+/// or write-watch pages). Returns `false` if unavailable or a page faulted.
+pub(crate) fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !put_on() || was.len() != now.len() || now.is_empty() {
+            return false;
+        }
+        let n = now.len();
+        if faulted_lately_in(&WRECENT, &WEMPTIED, dst as usize, n) {
+            WCOUNT[3].fetch_add(1, Relaxed);
+            return false;
+        }
+        install();
+        let head = (dst as usize).wrapping_neg() & 3;
+        let head = head.min(n);
+        let blocks = (n - head) / 32;
+        let tail = head + blocks * 32;
+        let mut all = true;
+        if blocks > 0 {
+            all &= unsafe {
+                victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0
+            };
+        }
+        let single = |from: usize, to: usize| {
+            let mut ok = true;
+            let mut i = from;
+            while i < to {
+                let len = (4 - ((dst as usize) + i) % 4).min(to - i);
+                if was[i..i + len] != now[i..i + len] {
+                    ok &= unsafe { guarded_write(dst.add(i), now[i..].as_ptr(), len) };
+                }
+                i += len;
+            }
+            ok
+        };
+        if all {
+            all &= single(0, head);
+        }
+        if all {
+            all &= single(tail, n);
+        }
+        if all {
+            WCOUNT[0].fetch_add(1, Relaxed);
+            WCOUNT[1].fetch_add(n as u64, Relaxed);
+        } else {
+            WCOUNT[2].fetch_add(1, Relaxed);
+            note_fault_in(&WRECENT, dst as usize, n);
+        }
+        all
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (dst, was, now);
+        false
+    }
 }
 
 pub(crate) fn line(frames: f64) {
