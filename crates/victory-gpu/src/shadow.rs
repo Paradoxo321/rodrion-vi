@@ -83,6 +83,9 @@ pub(crate) struct Shadow {
     /// L0 Write-Back physical-page pool (`NULL` on holes, deduplicated on
     /// aliased pages). `data` is null; all CPU accesses go through `tiled`.
     tiled: Option<crate::tiled::TiledBacking>,
+    /// (Neptune / avatarmanz) Last 2 whole ranges `(from, to, asking)` copied,
+    /// avoiding repeated re-copies of partial 64 KiB boundary pages (`VICTORY_RANGED=1`).
+    ranged: Mutex<[(usize, usize, u64); 2]>,
 }
 
 /// Staging backing for a VRAM `Card` copy: either a zero-copy
@@ -1988,6 +1991,63 @@ fn dword_runs(runs: Vec<(usize, usize)>, lo: usize, n: usize) -> Vec<(usize, usi
     out
 }
 
+/// (Neptune / avatarmanz) `VICTORY_RANGED=1` (on by default): skips re-copying partial
+/// 64 KiB boundary pages when the full range was already copied and not written since.
+fn ranged_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGED").is_none_or(|v| v != "0"))
+}
+
+/// (Neptune) `VICTORY_COPY_CHANGED=1`: only upload changed 256-byte spans to VRAM card copies.
+fn copy_changed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_CHANGED").is_some_and(|v| v == "1"))
+}
+
+/// Adds the 4 KiB sub-pages of `page` set in `mask` to the contiguous byte run.
+fn extend_runs_4k(run: &mut Option<(usize, usize)>, done: &mut Vec<(usize, usize)>, page: usize, mask: u16) {
+    const SUB: usize = 4096;
+    if mask == u16::MAX {
+        let (a, b) = (page * PAGE, (page + 1) * PAGE);
+        match run {
+            Some((_, e)) if *e == a => *e = b,
+            _ => done.extend(run.replace((a, b))),
+        }
+        return;
+    }
+    for k in (0..16).filter(|k| (mask >> k) & 1 == 1) {
+        let (a, b) = (page * PAGE + k * SUB, page * PAGE + (k + 1) * SUB);
+        match run {
+            Some((_, e)) if *e == a => *e = b,
+            _ => done.extend(run.replace((a, b))),
+        }
+    }
+}
+
+/// Finds changed `(offset, len)` spans between `now` and `was` in 256-byte steps,
+/// joining spans less than 1 KiB apart.
+fn changed_spans_256(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    const STEP: usize = 256;
+    const JOIN: usize = 1024;
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    if now[..n] == was[..n] {
+        return runs;
+    }
+    let mut i = 0;
+    while i < n {
+        let end = (i + STEP).min(n);
+        if now[i..end] != was[i..end] {
+            match runs.last_mut() {
+                Some(last) if i <= last.0 + last.1 + JOIN => last.1 = end - last.0,
+                _ => runs.push((i, end - i)),
+            }
+        }
+        i = end;
+    }
+    runs
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -2551,6 +2611,7 @@ impl Shadow {
             window: false,
             place: None,
             tiled: None,
+            ranged: Mutex::new([(0, 0, 0); 2]),
         }
     }
 
@@ -3343,15 +3404,31 @@ impl Shadow {
         }
     }
 
+    /// (Neptune / avatarmanz) Earliest asking at which `[from, to)` was already copied whole.
+    fn ranged_at(&self, from: usize, to: usize) -> u64 {
+        let r = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+        let mut best = 0u64;
+        for &(a, b, at) in r.iter() {
+            if at != 0 && a <= from && to <= b {
+                best = best.max(at);
+            }
+        }
+        best
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), using `VICTORY_RANGED=1` + `VICTORY_WATCH_4K=1` when enabled.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
+        let mut bytes = 0usize;
+        let mut run: Option<(usize, usize)> = None;
+        let mut bytes_runs: Vec<(usize, usize)> = Vec::new();
         let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let ranged = if ranged_on() { self.ranged_at(from, to) } else { 0 };
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -3361,21 +3438,30 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+            let taken = (*at).max(ranged);
+            // A page only partly in the range is copied in part: it stays stale for the rest.
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+            if taken == 0 || write > taken {
+                let mask = crate::watch::stale_mask(page, taken).unwrap_or(u16::MAX);
+                if whole {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy_with_watch((first * PAGE).max(from), (page * PAGE).min(to), Some(now));
+                extend_runs_4k(&mut run, &mut bytes_runs, page, mask);
             }
         }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy_with_watch((first * PAGE).max(from), ((last + 1) * PAGE).min(to), Some(now));
+        if ranged_on() {
+            let mut r = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            r[0] = (from, to, now);
+            if to - from >= r[1].1 - r[1].0 {
+                r[1] = (from, to, now);
+            }
+        }
+        bytes_runs.extend(run);
+        for (a, b) in bytes_runs {
+            let (a, b) = (a.max(from), b.min(to));
+            if a < b {
+                bytes += self.copy_with_watch(a, b, Some(now));
+            }
         }
         bytes
     }
@@ -3388,6 +3474,9 @@ impl Shadow {
     fn copy_with_watch(&self, from: usize, to: usize, watch_now: Option<u64>) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
         if let Some(tiled) = &self.tiled {
             let copied = tiled.copy_from_title(from, to, watch_now);
             self.changed(from - start, to - start);
@@ -3409,9 +3498,32 @@ impl Shadow {
             };
             // SAFETY: inside the mapping (`from` and `to` are within the buffer).
             let at = unsafe { data.add(from - start) };
-            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+            // (Neptune) `VICTORY_COPY_CHANGED=1`: for VRAM card copies, diff against what
+            // the staging copy already holds and only upload changed 256-byte spans (cuts
+            // write-back ping-pong uploads dramatically).
+            let n = to - from;
+            if n <= (16 << 20) && copy_changed_on() {
+                // SAFETY: `n` bytes inside staging mapping, exclusive to this refresh.
+                let held = unsafe { std::slice::from_raw_parts_mut(at, n) };
+                thread_local! {
+                    static TITLE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                TITLE_SCRATCH.with(|buf| {
+                    let mut title = buf.borrow_mut();
+                    title.clear();
+                    title.extend_from_slice(held);
+                    crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, n, false);
+                    let spans = changed_spans_256(&title, held);
+                    for &(off, len) in &spans {
+                        held[off..off + len].copy_from_slice(&title[off..off + len]);
+                        self.card_changed(from - start + off, from - start + off + len);
+                    }
+                });
+                return n;
+            }
+            crate::host::copy_mapped(at, from as *const u8, n, false);
             self.card_changed(from - start, to - start);
-            return to - from;
+            return n;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
@@ -3699,10 +3811,39 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        // (Neptune) Our write is not the title's (`VICTORY_QUIET_BACK=1`):
+        // write guarded-clean view memory through a private section view so no
+        // guard faults or re-protects, and advance this copy's `copied[]` mark.
+        if crate::watch::quiet_back()
+            && crate::watch::guarded_clean(start + at, n)
+            && let Some(alias) = crate::inplace::host_alias(start + at, n)
+            && crate::plaincopy::write(alias, title.as_ptr(), n)
+        {
+            crate::descriptor::host::remapped(start + at, n);
+            let marks = crate::watch::ours_through(start + at, n);
+            self.holds(&marks);
+            return n;
+        }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+
+    /// (Neptune) The copy-back wrote the journal pages of `marks` (`page, prev, now`)
+    /// into title memory from this copy, which already holds those bytes: advance
+    /// `copied[]` so they are not re-read/compared on the next submission.
+    fn holds(&self, marks: &[(usize, u64, u64)]) {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for &(page, before, now) in marks {
+            if let Some(held) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *held != 0
+                && before <= *held
+            {
+                *held = now;
+            }
+        }
     }
 }
 
@@ -3712,10 +3853,17 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+// (Neptune) Read by many at once: recording / `VICTORY_THIN=1` worker threads
+// look a copy up for every buffer view a draw names without serializing on one lock.
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -3738,7 +3886,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -3885,7 +4033,10 @@ pub(crate) fn in_place_take_private(
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read()
+        .iter()
+        .map(|(key, entry)| (key.0, entry.end - key.0, false))
+        .collect();
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
@@ -3925,6 +4076,24 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // (Neptune) Fast path: shared read lock for the 99.9% case where the buffer's
+    // shadow already exists (eliminates write-lock contention across `VICTORY_THIN` threads).
+    {
+        let map = buffers_read();
+        let found = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end);
+        match found {
+            None => {
+                drop(map);
+                return loose(address, end, len <= 1, any);
+            }
+            Some((_, e)) if e.shadow.is_some() => return e.shadow.clone(),
+            Some(_) => {}
+        }
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -4670,7 +4839,7 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

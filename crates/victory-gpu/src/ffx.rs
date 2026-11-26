@@ -487,7 +487,7 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     // SAFETY: a description of this type.
     let mut d = unsafe { *desc.cast::<DispatchUpscale>() };
     let title_list = d.command_list as This;
-    let Some(list) = crate::list::host_list(title_list) else {
+    let Some(list) = crate::list::host_list_caught_up(title_list) else {
         return ERROR_PARAMETER;
     };
     let output = d.resources[OUTPUT].resource as This;

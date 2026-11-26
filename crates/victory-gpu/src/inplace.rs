@@ -823,6 +823,53 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// (Neptune) Views of our own of the title's sections, whole and writable, by the section's
+/// handle: the address (0: it could not be mapped) and the section's bytes.
+static ALIASES: Mutex<Vec<(usize, usize, u64)>> = Mutex::new(Vec::new());
+
+/// (Neptune) Where the bytes of title view memory `[at, at + len)` are in a view of our own of
+/// the same section: the same physical pages at an address the guards know nothing of.
+/// What is written there is in title memory at once, with no protection changed and no
+/// fault; who writes there tells the journal itself (`crate::watch::ours_through`).
+/// `None` if the range is not inside one title view, or the section cannot be mapped.
+pub(crate) fn host_alias(at: usize, len: usize) -> Option<*mut u8> {
+    let (within, bytes, section, offset, size) = {
+        let v = views();
+        let (&base, &(bytes, section, offset)) = v.views.range(..=at).next_back()?;
+        let size = v.sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+        (at.checked_sub(base)?, bytes, section, offset, size)
+    };
+    if len == 0 || within.checked_add(len)? > bytes || offset + (within + len) as u64 > size {
+        return None;
+    }
+    let mut aliases = ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let host = match aliases.iter().find(|a| a.0 == section) {
+        Some(a) => a.1,
+        None => {
+            // SAFETY: a section handle the runtime gave; the whole section, to read and write.
+            let host = unsafe {
+                mem::MapViewOfFile(
+                    section as _,
+                    mem::FILE_MAP_READ | mem::FILE_MAP_WRITE,
+                    0,
+                    0,
+                    0,
+                )
+            }
+            .Value as usize;
+            tracing::info!(
+                section = format_args!("{section:#x}"),
+                mb = size >> 20,
+                mapped = host != 0,
+                "a view of our own of a title section, for what shaders wrote to go into title memory through (VICTORY_QUIET_BACK=1)"
+            );
+            aliases.push((section, host, size));
+            host
+        }
+    };
+    (host != 0).then(|| (host + offset as usize + within) as *mut u8)
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

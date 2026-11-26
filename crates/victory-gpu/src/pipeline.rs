@@ -143,10 +143,49 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// (Vertex) Whether it can store to title memory by address (not through a view).
+    pub(crate) stores_by_address: bool,
+    /// (Neptune) Host DXIL moved out of `host` so `VICTORY_DROP_DXIL=1` can release it
+    /// from RAM once pipelines are built (reloaded from the disk shader cache on demand).
+    dxil: Mutex<Option<Arc<Vec<u8>>>>,
+}
+
+/// (Neptune) `VICTORY_DROP_DXIL=1` (off by default): frees translated DXIL bytes from RAM
+/// after pipelines are built (huge RAM relief on 16 GB systems).
+#[cfg(windows)]
+pub(crate) fn drop_dxil() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_DXIL").is_some_and(|v| v == "1"))
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// Returns the translated DXIL bytes, reloading from the disk shader cache if previously
+    /// released by [`Shader::release_dxil`].
+    pub(crate) fn dxil(&self) -> Option<Arc<Vec<u8>>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t = self.translated()?;
+        let mut held = t.dxil.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            let again = crate::shader_cache::host_shader(&self.container).ok()?.dxil;
+            KEPT[3].fetch_add(again.len() as u64, Relaxed);
+            *held = Some(Arc::new(again));
+        }
+        held.clone()
+    }
+
+    /// With `VICTORY_DROP_DXIL=1`: releases translated DXIL bytes from RAM after PSO creation.
+    pub(crate) fn release_dxil(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !drop_dxil() {
+            return;
+        }
+        let Some(Some(t)) = self.translated.get() else { return };
+        if let Some(d) = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            KEPT[3].fetch_sub(d.len() as u64, Relaxed);
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -160,13 +199,16 @@ impl Shader {
                     let _ = std::fs::create_dir_all(&dir);
                     let stem = format!("{}.{}", self.hash, self.stage);
                     let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+                    if let Ok(t) = &done
+                        && let Some(dxil) = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                    {
+                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &**dxil);
                     }
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let len = t.dxil.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |d| d.len());
+                    KEPT[3].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -199,8 +241,10 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let mut host = crate::shader_cache::host_shader(container)?;
+    let dxil = std::mem::take(&mut host.dxil);
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -211,7 +255,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        stores_by_address,
+        dxil: Mutex::new(Some(Arc::new(dxil))),
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -355,6 +405,25 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// (Vertex 61d715e) Whether a console program can store to title memory by
+/// address: a global or flat store or atomic, or code that is not all known.
+/// Only such a program can have written a copy that title memory by address
+/// leads to; one that loads by address and stores through views does not.
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| match i.encoding {
+        Encoding::Flat | Encoding::Global => i
+            .name()
+            .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")),
+        Encoding::Sop1 => i.name().is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+        _ => false,
     })
 }
 

@@ -20,6 +20,8 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -42,6 +44,8 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

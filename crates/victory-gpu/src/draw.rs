@@ -1099,7 +1099,12 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                // (Vertex 61d715e) Declared written only by a program that can store by
+                // address; what it stores through views its views say.
+                // `VICTORY_MEMORY_DECLARE=all`: every storing program, as before.
+                static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DECLARE").is_some_and(|v| v == "all"));
+                let Some(ready) = self.memory_ready(list, compute, writes && (t.stores_by_address || all)) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -3297,6 +3302,57 @@ impl State {
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
+        }
+        // (Neptune) `VICTORY_INDIRECT_RAW=2`: execute indirect draws/mesh/dispatches directly
+        // from the host copy of the title's arguments without per-record clamp compute dispatches
+        // and draw-to-compute-to-draw stalls (except >65,535-group split dispatches).
+        static RAW_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let raw_all = *RAW_ALL.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RAW").is_some_and(|v| v == "2"));
+        let split_dispatch = kind == DISPATCH && max == 1 && count.is_none() && group_base(p).is_some();
+        if raw_all && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split_dispatch {
+            self.window = None;
+            list.end_mesh_batch();
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
+            let ran = match kind {
+                DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                MESH => self.prepare_for(list, false, true),
+                _ => self.bind(list, p, true),
+            };
+            if !ran {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("indirect raw kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH));
+            if kind == MESH {
+                self.mesh_scissor(list, true);
+            }
+            // SAFETY: open list with state bound; `args` and `counter` stay alive via `refresh`.
+            unsafe {
+                match &counter {
+                    Some((s, at)) => list.list.ExecuteIndirect(
+                        &signature,
+                        max,
+                        &args.buffer,
+                        args.offset(arguments),
+                        Some(&s.buffer),
+                        s.offset(*at),
+                    ),
+                    None => list.list.ExecuteIndirect(
+                        &signature,
+                        max,
+                        &args.buffer,
+                        args.offset(arguments),
+                        None::<&ID3D12Resource>,
+                        0,
+                    ),
+                }
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no

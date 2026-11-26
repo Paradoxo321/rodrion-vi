@@ -1143,6 +1143,9 @@ pub(crate) struct HostTexture {
     /// Its range of a heap of plain textures ([`heaped_texture`]), given
     /// back when nothing holds the texture any more.
     cut: Option<Cut>,
+    /// (Neptune / Marvisak) Clean 64 KiB-aligned texture placement heap slot
+    /// (`crate::placement`), released once no COM reference remains.
+    placement: Option<crate::placement::Placement>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1536,9 +1539,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 let heaped = r.host.placed.load(Relaxed)
                     && fills(&r.desc)
                     && texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
-                host_texture(&r.desc, r.host.state, clear, r.data() as usize, dropped, heaped)
+                MARVISAK_PLACE_OK.set(true);
+                let res = host_texture(&r.desc, r.host.state, clear, r.data() as usize, dropped, heaped);
+                MARVISAK_PLACE_OK.set(false);
+                res
             }
         };
+        let marvisak_placement = MARVISAK_PLACED.take();
         let Some((texture, range)) = texture else {
             r.host.refused.store(true, Relaxed);
             return None;
@@ -1561,6 +1568,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.cut = range;
+        host.placement = marvisak_placement;
         host.filled = fills(&r.desc);
         host.dropped = dropped;
         if dropped > 0 {
@@ -1632,7 +1640,9 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            let used = used.saturating_sub(HEAP_FREE.load(Relaxed));
+            let used = used
+                .saturating_sub(HEAP_FREE.load(Relaxed))
+                .saturating_sub(crate::placement::free_bytes());
             used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2182,6 +2192,7 @@ impl HostTexture {
             tiled: None,
             dropped: 0,
             cut: None,
+            placement: None,
         }
     }
 
@@ -2201,6 +2212,7 @@ impl HostTexture {
             tiled: Some(tiled),
             dropped: 0,
             cut: None,
+            placement: None,
         }
     }
 }
@@ -2214,6 +2226,9 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        if let Some(p) = self.placement.take() {
+            crate::placement::free(self.texture.clone(), p);
         }
         if let Some(cut) = self.cut.take() {
             let mut leaving = LEAVING.lock().unwrap_or_else(|e| e.into_inner());
@@ -2541,6 +2556,20 @@ fn host_texture_as(
     host_texture_in(desc, state, clear, reserved, title_address, dropped, false).map(|(t, _)| t)
 }
 
+/// (Neptune / Marvisak) Clean 64 KiB-aligned texture placement heaps (`VICTORY_PLACEMENT_HEAPS=1`,
+/// on by default: 255 ms -> 3 ms for 300 textures on RDNA 2, without the 4 KiB small-alignment hang).
+#[cfg(windows)]
+fn placement_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACEMENT_HEAPS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+thread_local! {
+    static MARVISAK_PLACE_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MARVISAK_PLACED: std::cell::Cell<Option<crate::placement::Placement>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(windows)]
 fn host_texture_in(
     desc: &ResourceDesc,
@@ -2609,6 +2638,47 @@ fn host_texture_in(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    MARVISAK_PLACED.set(None);
+    if !reserved
+        && clear_value.is_none()
+        && d.flags == 0
+        && d.sample_count <= 1
+        && MARVISAK_PLACE_OK.get()
+        && placement_heaps()
+    {
+        // SAFETY: `ResourceDesc` matches `D3D12_RESOURCE_DESC` layout.
+        let dd: &D3D12_RESOURCE_DESC = unsafe { &*(&raw const d).cast() };
+        if crate::placement::fits(&host.device, dd)
+            && let Some((tex_heap, placement)) = crate::placement::place(&host.device, dd)
+        {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: exclusive 64 KiB-aligned range in `tex_heap`.
+            let made = unsafe {
+                host.device.CreatePlacedResource(
+                    &tex_heap,
+                    placement.offset(),
+                    dd,
+                    D3D12_RESOURCE_STATES(
+                        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                    ),
+                    None,
+                    &mut texture,
+                )
+            };
+            match (made, texture) {
+                (Ok(()), Some(t)) => {
+                    crate::host::name(&t, || {
+                        format!("texture {}x{} f{} placed", d.width, d.height, d.format)
+                    });
+                    MARVISAK_PLACED.set(Some(placement));
+                    return Some((t, None));
+                }
+                _ => {
+                    crate::placement::unplace(placement);
+                }
+            }
+        }
+    }
     if heaped
         && !reserved
         && d.sample_count <= 1

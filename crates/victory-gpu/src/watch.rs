@@ -414,8 +414,140 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        whole_4k(page, now);
         j.written.insert(page, now);
     }
+}
+
+/// (Neptune) Whether what the copy-back writes into guarded view title memory
+/// goes through a private unguarded section view (`VICTORY_QUIET_BACK=1`):
+/// zero page faults, zero `VirtualProtect` shootdowns, and the copy it came
+/// from is told it already holds those bytes so it does not re-read/compare
+/// them on the next submission.
+pub(crate) fn quiet_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUIET_BACK").is_some_and(|v| v == "1"))
+}
+
+/// (Neptune) Whether view memory `[at, at + len)` is all guarded and clean:
+/// nothing was written there since a copy last took it ([`quiet_back`]).
+pub(crate) fn guarded_clean(at: usize, len: usize) -> bool {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    first < last
+        && GUARDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clean
+            .all_present(first, last)
+}
+
+/// (Neptune) After our own write of view memory `[at, at + len)` through a
+/// private section view (`crate::inplace::host_alias`), which no guard saw:
+/// the journal records its pages as written now at every title view that shows
+/// them, and returns `(page, prev_asking, new_asking)` so the source shadow
+/// can advance its own `copied[]` mark without re-reading its own write.
+pub(crate) fn ours_through(at: usize, len: usize) -> Vec<(usize, u64, u64)> {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    let mut marks = Vec::new();
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        whole_4k(page, now);
+        let before = j.written.insert(page, now).unwrap_or(0);
+        marks.push((page, before, now));
+        for alias in crate::inplace::pages_of(page * PAGE) {
+            if alias / PAGE != page {
+                whole_4k(alias / PAGE, now);
+                j.written.insert(alias / PAGE, now);
+            }
+        }
+    }
+    marks
+}
+
+/// (Neptune) Whether written-ness is also tracked per 4 KiB sub-page (`VICTORY_WATCH_4K=1`):
+/// allows `Shadow::copy_stale` to copy only the modified 4 KiB sub-pages instead of all 64 KiB.
+pub(crate) fn watch_4k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_4K").is_some_and(|v| v == "1"))
+}
+
+const PART_4K: usize = 1 << 16;
+
+struct Part4k([std::sync::atomic::AtomicU64; PART_4K]);
+
+static WHOLE_4K: [std::sync::atomic::AtomicPtr<Part4k>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+static SUBS_4K: [std::sync::atomic::AtomicPtr<Part4k>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+fn part_4k(table: &[std::sync::atomic::AtomicPtr<Part4k>; 1 << 16], index: usize, make: bool) -> Option<&'static Part4k> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let slot = table.get(index / PART_4K)?;
+    let mut at = slot.load(Acquire);
+    if at.is_null() {
+        if !make {
+            return None;
+        }
+        let layout = std::alloc::Layout::new::<Part4k>();
+        // SAFETY: zero-initialized array of `AtomicU64` is valid.
+        let fresh = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<Part4k>();
+        if fresh.is_null() {
+            return None;
+        }
+        match slot.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+            Ok(_) => at = fresh,
+            Err(other) => {
+                // SAFETY: ours alone, allocated with `layout`.
+                unsafe { std::alloc::dealloc(fresh.cast(), layout) };
+                at = other;
+            }
+        }
+    }
+    // SAFETY: a part once installed is never freed.
+    Some(unsafe { &*at })
+}
+
+#[inline]
+fn whole_4k(page: usize, now: u64) {
+    if watch_4k()
+        && let Some(p) = part_4k(&WHOLE_4K, page, true)
+    {
+        p.0[page % PART_4K].store(now, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[inline]
+fn found_4k(address: usize, now: u64) {
+    if !watch_4k() {
+        return;
+    }
+    let sub = address / KERNEL_PAGE;
+    match part_4k(&SUBS_4K, sub, true) {
+        Some(p) => p.0[sub % PART_4K].store(now, std::sync::atomic::Ordering::Release),
+        None => whole_4k(address / PAGE, now),
+    }
+}
+
+/// Returns the 16-bit mask of 4 KiB sub-pages of 64 KiB `page` written after `at`,
+/// or `None` if the whole 64 KiB page must be copied.
+pub(crate) fn stale_mask(page: usize, at: u64) -> Option<u16> {
+    use std::sync::atomic::Ordering::Acquire;
+    if at == 0 || !watch_4k() {
+        return None;
+    }
+    if part_4k(&WHOLE_4K, page, false).is_some_and(|p| p.0[page % PART_4K].load(Acquire) > at) {
+        return None;
+    }
+    let sub = page * (PAGE / KERNEL_PAGE);
+    let part = part_4k(&SUBS_4K, sub, false)?;
+    let mut mask = 0u16;
+    for k in 0..(PAGE / KERNEL_PAGE) {
+        if part.0[(sub + k) % PART_4K].load(Acquire) > at {
+            mask |= 1u16 << k;
+        }
+    }
+    (mask != 0).then_some(mask)
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -474,7 +606,9 @@ fn ask_kernel_found(j: &mut Journal, first: usize, last: usize) -> Option<usize>
     }
     let now = j.ahead_asked;
     for k in 0..count {
-        let page = j.found[k] / PAGE;
+        let addr = j.found[k];
+        found_4k(addr, now);
+        let page = addr / PAGE;
         j.written.insert(page, now);
     }
     Some(count)
@@ -568,8 +702,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    for k in 0..count {
+        let addr = j.found[k];
+        found_4k(addr, now);
+        j.written.insert(addr / PAGE, now);
+    }
+    for page in guarded {
+        whole_4k(page, now);
         j.written.insert(page, now);
     }
     Some((

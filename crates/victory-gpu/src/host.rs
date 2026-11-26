@@ -7618,6 +7618,16 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            crate::list::thin::line(frames);
+            let (p_heaps, p_total, p_free) = crate::placement::stats();
+            if p_heaps > 0 {
+                tracing::info!(
+                    heaps = p_heaps,
+                    total_mb = p_total >> 20,
+                    free_mb = p_free >> 20,
+                    "placement texture heaps (VICTORY_PLACEMENT_HEAPS=1)"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
