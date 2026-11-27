@@ -6967,6 +6967,17 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            REFRESH_COALESCE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            if refresh_coalesce()
+                && let Some(Step::Refresh(previous, at, n)) = deferred.copies.last_mut()
+                && std::sync::Arc::ptr_eq(previous, shadow)
+                && try_coalesce_refresh_range(at, n, address, len)
+            {
+                let merged_key = (std::sync::Arc::as_ptr(shadow) as usize, *at, *n);
+                deferred.refreshed.insert(merged_key);
+                REFRESH_COALESCE_STATS[1].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
@@ -7213,6 +7224,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     BATCH_RANGE_STATS[0].fetch_add(1, Ordering::Relaxed);
+                    crate::port::copied(dst, src, len);
                     let range_ok = batch_range_flush() && !has_multi_view_alias(dst, len);
                     if range_ok {
                         batch.title_written_range(dst, len);
@@ -7232,6 +7244,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    crate::port::filled(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -7324,6 +7337,32 @@ fn batch_range_flush() -> bool {
 /// `[0]` `Step::Copy` steps, `[1]` refreshes kept coalesced, `[2]` refreshes flushed on overlap,
 /// `[3]` cached textures kept across `Step::Copy`.
 static BATCH_RANGE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `VICTORY_REFRESH_COALESCE=1` (default off): merge adjacent/overlapping
+/// `Step::Refresh` records on the same shadow in `HostList::defer_refresh`
+/// (ported from `gleaf-6/VIctory-7900XTX-` `cb1aa34`).
+fn refresh_coalesce() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_COALESCE").is_some_and(|v| v == "1"))
+}
+
+static REFRESH_COALESCE_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[inline]
+fn try_coalesce_refresh_range(at: &mut usize, n: &mut usize, address: usize, len: usize) -> bool {
+    let end = at.saturating_add(*n);
+    let next_end = address.saturating_add(len);
+    if address <= end && *at <= next_end {
+        let merged_start = (*at).min(address);
+        let merged_end = end.max(next_end);
+        *at = merged_start;
+        *n = merged_end - merged_start;
+        true
+    } else {
+        false
+    }
+}
 
 /// Pure range-tracking logic tested deterministically alongside [`Batch`].
 #[cfg(test)]
@@ -8345,6 +8384,16 @@ impl Meter {
         }
         crate::draw::table_memo_line(frames);
         crate::shadow::exact_line(frames);
+        crate::shadow::root_reach_line(frames);
+        crate::port::log(frames);
+        if refresh_coalesce() {
+            let [tot, merged] = [0, 1].map(|i| REFRESH_COALESCE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if tot > 0.0 {
+                tracing::info!(
+                    "refresh coalesce (VICTORY_REFRESH_COALESCE=1): {tot:.1} refresh steps/frame, {merged:.1} coalesced with previous"
+                );
+            }
+        }
         crate::descriptor::sync_line(frames);
         crate::watch::fast_stats_line(frames);
         crate::tiled::fast_sync_line(frames);
@@ -9779,5 +9828,21 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
         assert!(p.is_empty());
         assert_eq!(d[0].3, OffloadDeclineReason::IntraDstRefreshOtherShadow);
+    }
+
+    #[test]
+    fn refresh_coalesce_merges_adjacent_and_overlapping_and_keeps_disjoint_separate() {
+        // Adjacent: [100, 164) followed by [164, 228) -> [100, 228)
+        let (mut at, mut len) = (100usize, 64usize);
+        assert!(super::try_coalesce_refresh_range(&mut at, &mut len, 164, 64));
+        assert_eq!((at, len), (100, 128));
+
+        // Overlapping earlier: [80, 110) -> [80, 228)
+        assert!(super::try_coalesce_refresh_range(&mut at, &mut len, 80, 30));
+        assert_eq!((at, len), (80, 148));
+
+        // Disjoint with gap: [300, 364) -> false, range unchanged
+        assert!(!super::try_coalesce_refresh_range(&mut at, &mut len, 300, 64));
+        assert_eq!((at, len), (80, 148));
     }
 }

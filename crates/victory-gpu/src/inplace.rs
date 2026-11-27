@@ -431,6 +431,18 @@ pub(crate) fn place_for_direct(start: u64, len: u64) -> Option<Placed> {
     }
 }
 
+/// Records an in-place placement made outside [`place_for`] (e.g. `crate::port`).
+pub(crate) fn counted(window: bool, bytes: u64, section: bool) {
+    let at = if window { 0 } else { 2 };
+    if section {
+        SECTION_STATS[at].fetch_add(1, Ordering::Relaxed);
+        SECTION_STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+    } else {
+        STATS[at].fetch_add(1, Ordering::Relaxed);
+        STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64, section: bool) {
     let at = if window { 0 } else { 2 };
@@ -461,6 +473,7 @@ pub(crate) fn direct_gone(bytes: u64, section: bool) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed)
         + STATS[2].load(Ordering::Relaxed)
         + DIRECT_STATS[0].load(Ordering::Relaxed)
@@ -952,6 +965,41 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// The whole stretch of views around `[at, at + len)` that follow one another
+/// in virtual memory and in one section alike: `(first_va, bytes, section, offset)`.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    at: usize,
+    len: usize,
+) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1653,6 +1701,9 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+        // Contiguous views in the same section coalesce into one stretch stopping before non-contiguous slices.
+        assert_eq!(stretch_in(&views, at + K64, 2 * K64), Some((at, 6 * K64, 9, 16 * K64 as u64)));
+        assert_eq!(stretch_in(&views, at, 7 * K64), None);
     }
 
     /// What the runtime forgets when memory is mapped anew.

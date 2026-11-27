@@ -171,6 +171,23 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Track 32-bit graphics reservations (`kind` 0x42000, below 4 GiB) so
+    // `VICTORY_PORT_CONSTANTS=1` can arrange fresh slices in VA order.
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
+        LOW_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((at as usize, size));
+        if port_on() {
+            tracing::info!(
+                at = format_args!("{at:p}"),
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                "renderer port 1: 32-bit graphics reservation recorded (VICTORY_PORT_CONSTANTS)"
+            );
+        }
+    }
     at
 }
 
@@ -1536,6 +1553,98 @@ fn private_block_at(physical: &Physical, va: usize) -> Option<(usize, usize)> {
         .and_then(|(&base, m)| (m.is_private() && base + m.len() > va).then_some((base, m.len())))
 }
 
+/// `VICTORY_PORT_CONSTANTS=1` (default off): arrange fresh slices of a
+/// 32-bit graphics reservation in address order so the whole heap forms one
+/// contiguous stretch of its section.
+fn port_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn arrange(physical: &mut Physical, base: usize, pages: &[usize]) {
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base.saturating_add(pages.len() * PAGE) <= at + len)
+    else {
+        return;
+    };
+    let Some(section) = pages.first().and_then(|p| physical.pages.get(p)).map(|s| s.section.clone()) else {
+        return;
+    };
+    if section.2.size < bytes
+        || !pages
+            .iter()
+            .all(|p| physical.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
+    {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                pages = pages.len(),
+                section_bytes = section.2.size,
+                reservation = bytes,
+                "renderer port 1: pages mapped into 32-bit heap span multiple sections; leaving as allocated"
+            );
+        }
+        return;
+    }
+    let sec_ptr = Arc::as_ptr(&section) as usize;
+    let is_fresh = |phys: &Physical, index: usize| {
+        !section.is_committed(index, 1)
+            && !phys.shown.contains_key(&(sec_ptr, index))
+            && !phys.private_at.contains_key(&(sec_ptr, index))
+            && !phys.in_section.contains(&(sec_ptr, index))
+    };
+    let mut owner: HashMap<usize, usize> = physical
+        .pages
+        .iter()
+        .filter(|(_, s)| Arc::ptr_eq(&s.section, &section))
+        .map(|(&number, s)| (s.index, number))
+        .collect();
+    let mut moved = 0u64;
+    for (i, number) in pages.iter().enumerate() {
+        let want = (base - first) / PAGE + i;
+        let Some(have) = physical.pages.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if !is_fresh(physical, have) || !is_fresh(physical, want) {
+            ARRANGED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if let Some(other) = owner.get(&want).copied()
+            && let Some(slice) = physical.pages.get_mut(&other)
+        {
+            slice.index = have;
+            owner.insert(have, other);
+        }
+        if let Some(slice) = physical.pages.get_mut(number) {
+            slice.index = want;
+        }
+        owner.insert(want, *number);
+        moved += 1;
+    }
+    if moved > 0 {
+        let all = ARRANGED[0].fetch_add(moved, Ordering::Relaxed) + moved;
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            all,
+            not_fresh = ARRANGED[1].load(Ordering::Relaxed),
+            "renderer port 1: 32-bit graphics pages arranged in address order"
+        );
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1551,6 +1660,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     } else {
         // SAFETY: the title passes `n` page numbers.
         let page_nums = unsafe { std::slice::from_raw_parts(pages, n) };
+        if port_on() {
+            arrange(&mut physical, base, page_nums);
+        }
         let mut out = Vec::with_capacity(n);
         for &p in page_nums {
             let Some(slice) = physical.pages.get(&p).cloned() else {
@@ -2699,6 +2811,37 @@ mod tests {
         assert!(reader.join().expect("reader survived without AV") > 0);
         assert!(writer.join().expect("writer survived without AV or lost write") > 0);
         assert_eq!(XMemMapPhysicalPages(va, 4, std::ptr::null()), va);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn arrange_reorders_fresh_32bit_slices_in_va_order_and_skips_committed() {
+        let base = 0x3431_0000usize;
+        let pages = allocate(4);
+        {
+            let mut phys = physical();
+            // Swap page 0 and page 3 indices to mimic out-of-order slice allocation.
+            let i0 = phys.pages[&pages[0]].index;
+            let i3 = phys.pages[&pages[3]].index;
+            phys.pages.get_mut(&pages[0]).unwrap().index = i3;
+            phys.pages.get_mut(&pages[3]).unwrap().index = i0;
+            // Mark slice index 1 as already committed -> must NOT be moved!
+            let sec = phys.pages[&pages[0]].section.clone();
+            sec.mark_committed(1, 1);
+
+            LOW_RESERVATIONS
+                .lock()
+                .unwrap()
+                .push((base, 4 * PAGE));
+            arrange(&mut phys, base, &[pages[0], pages[1], pages[2], pages[3]]);
+            // Fresh slices moved to their VA slot (0 -> 0, 2 -> 2, 3 -> 3).
+            assert_eq!(phys.pages[&pages[0]].index, 0);
+            assert_eq!(phys.pages[&pages[2]].index, 2);
+            assert_eq!(phys.pages[&pages[3]].index, 3);
+            // Committed slice 1 was not touched.
+            assert_eq!(phys.pages[&pages[1]].index, 1);
+            LOW_RESERVATIONS.lock().unwrap().retain(|&(a, _)| a != base);
+        }
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 }

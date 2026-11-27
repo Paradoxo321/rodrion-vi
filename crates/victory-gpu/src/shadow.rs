@@ -2458,7 +2458,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2482,7 +2482,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -2523,7 +2523,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
@@ -2560,7 +2560,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -4062,7 +4062,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -4114,7 +4114,7 @@ pub(crate) fn in_place_take_private(
     let mut taken: Vec<Box<dyn std::any::Any>> = Vec::new();
     let mut raw_ptrs: Vec<usize> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| {
@@ -4197,7 +4197,7 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
         .iter()
         .map(|(key, entry)| (key.0, entry.end - key.0, false))
         .collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -4250,7 +4250,7 @@ pub(crate) fn find_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
             return Some(shadow.clone());
         }
     }
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     let hit = loose
         .range(..=(address, u64::MAX))
         .rev()
@@ -4325,6 +4325,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 );
             }
             entry.shadow = Some(window);
+            return entry.shadow.clone();
+        }
+        // Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): the title's 32-bit
+        // graphics heap in place, big or not (covers the 174 MB ring buffer).
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
@@ -4533,7 +4539,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -4583,7 +4589,68 @@ fn root_window(address: u64, end: u64) -> (u64, u64) {
     if most <= len {
         return (cell, len);
     }
-    root_extent(cell, len, committed_reach(cell + len, cell + most), most)
+    root_extent(cell, len, recent_reach(cell + len, cell + most), most)
+}
+
+/// How long a [`committed_reach`] `VirtualQuery` answer is cached in ms
+/// (`VICTORY_ROOT_REACH_MS`; default 0 = every time, e.g. 1000 = 1s cache).
+fn root_reach_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_ROOT_REACH_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+static ROOT_REACH_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn root_reach_line(frames: f64) {
+    let ms = root_reach_ms();
+    if ms == 0 {
+        return;
+    }
+    let [hits, misses] = [0, 1].map(|i| ROOT_REACH_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    if hits + misses > 0.0 {
+        tracing::info!(
+            "root view reach cache (VICTORY_ROOT_REACH_MS={ms}): {hits:.1} hits, {misses:.1} VirtualQuery misses per frame"
+        );
+    }
+}
+
+fn recent_reach_with(
+    found: &std::sync::RwLock<std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>>,
+    ms: u64,
+    from: u64,
+    limit: u64,
+    probe: impl FnOnce(u64, u64) -> u64,
+) -> u64 {
+    if ms == 0 {
+        return probe(from, limit);
+    }
+    let fresh = std::time::Duration::from_millis(ms);
+    if let Some(&(reach, at)) = found.read().unwrap_or_else(|e| e.into_inner()).get(&(from, limit))
+        && at.elapsed() < fresh
+    {
+        ROOT_REACH_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return reach;
+    }
+    ROOT_REACH_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let reach = probe(from, limit);
+    let mut map = found.write().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 4096 {
+        map.retain(|_, (_, at)| at.elapsed() < fresh);
+    }
+    map.insert((from, limit), (reach, std::time::Instant::now()));
+    reach
+}
+
+fn recent_reach(from: u64, limit: u64) -> u64 {
+    static FOUND: std::sync::LazyLock<
+        std::sync::RwLock<std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    recent_reach_with(&FOUND, root_reach_ms(), from, limit, committed_reach)
 }
 
 fn root_extent(cell: u64, len: u64, reach: u64, most: u64) -> (u64, u64) {
@@ -4606,16 +4673,53 @@ fn committed_reach(from: u64, limit: u64) -> u64 {
 }
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Uses `RwLock` (gleaf-6 `1bcb778`) so parallel lookup callers search
+/// existing windows concurrently without serializing on one `Mutex`.
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = if unsized_ask && !tails() {
         root_window(address, end)
     } else {
         window_of(address, end, if unsized_ask { WINDOW } else { window() })
     };
+    let note = |shadow: &Shadow| {
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            Some(holder(there, address, end).unwrap_or(named))
+        } else {
+            Some(named)
+        };
+        if let Some(key) = key
+            && let Some(shadow) = map.get(&key)
+        {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if !unsized_ask && crate::inplace::level() >= 1 {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            if let Some(hit_key) = holder(there, address, end)
+                && let Some(shadow) = map.get(&hit_key)
+            {
+                note(shadow);
+                return Some(shadow.clone());
+            }
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -4627,15 +4731,6 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         holder(there, address, end).unwrap_or(named)
     } else {
         named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
@@ -4653,7 +4748,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true)
+        .or_else(|| crate::inplace::place_for(start, len, true))
+    {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -5035,10 +5132,26 @@ mod card_merge_tests {
     fn find_existing_returns_none_without_allocating_loose_shadow() {
         let addr = 0x9_8be5_c430u64;
         let len = 20480u64;
-        let before = super::LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let before = super::LOOSE.read().unwrap_or_else(|e| e.into_inner()).len();
         assert!(super::find_existing(addr, len).is_none());
-        let after = super::LOOSE.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let after = super::LOOSE.read().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(after, before, "find_existing must never allocate a loose shadow");
+    }
+
+    #[test]
+    fn recent_reach_caches_probes_when_enabled_and_bypasses_when_zero() {
+        let cache = std::sync::RwLock::new(std::collections::HashMap::new());
+        let mut calls = 0u64;
+        // ms == 0: always invokes probe
+        let r0 = super::recent_reach_with(&cache, 0, 0x40_0000, 0x80_0000, |_, _| { calls += 1; 0x50_0000 });
+        let r1 = super::recent_reach_with(&cache, 0, 0x40_0000, 0x80_0000, |_, _| { calls += 1; 0x60_0000 });
+        assert_eq!((r0, r1, calls), (0x50_0000, 0x60_0000, 2));
+
+        // ms == 1000: second call within TTL hits cache without calling probe
+        calls = 0;
+        let a = super::recent_reach_with(&cache, 1000, 0x40_0000, 0x80_0000, |_, _| { calls += 1; 0x70_0000 });
+        let b = super::recent_reach_with(&cache, 1000, 0x40_0000, 0x80_0000, |_, _| { calls += 1; 0x99_0000 });
+        assert_eq!((a, b, calls), (0x70_0000, 0x70_0000, 1));
     }
 }
 
@@ -5051,7 +5164,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
