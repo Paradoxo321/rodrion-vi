@@ -10,12 +10,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoDir = "C:\Users\gabri\Downloads\victory-klbf-lab39"
-$GameExe = "C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
+$DownloadsDir = Join-Path $env:USERPROFILE "Downloads"
+$RepoDir = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $DownloadsDir "victory-klbf-lab39" }
+$DataDir = Join-Path $DownloadsDir "victory-data"
+$GameExe = Join-Path $DownloadsDir "GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
 $Exe = Join-Path $RepoDir "target\release\victory.exe"
-$FfxDir = "C:\Users\gabri\Downloads\victory-data\ffx-sdk-2.4"
+$FfxDir = Join-Path $DataDir "ffx-sdk-2.4"
 $SkipFile = Join-Path $RepoDir "docs\klbf\skip-amd.txt"
-$BenchRoot = Join-Path "C:\Users\gabri\Downloads\victory-data\bench" $Tag
+$BenchRoot = Join-Path (Join-Path $DataDir "bench") $Tag
 New-Item -ItemType Directory -Force -Path $BenchRoot | Out-Null
 
 if (-not (Test-Path $Exe)) { throw "Missing binary: $Exe" }

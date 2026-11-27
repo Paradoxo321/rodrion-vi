@@ -705,16 +705,19 @@ namespace VictoryLauncher
 
     sealed class LauncherForm : Form
     {
-        private const string RepoDir = @"C:\Users\gabri\Downloads\victory-klbf-lab39";
-        private const string GLeafDir = @"C:\Users\gabri\Downloads\victory-gleaf6";
-        private const string BackupsDir = @"C:\Users\gabri\Downloads\victory-backups";
-        private const string DataDir = @"C:\Users\gabri\Downloads\victory-data";
-        private const string ConfigPath = @"C:\Users\gabri\Downloads\victory-data\launcher-config.ini";
-        private const string DiscordIdPath = @"C:\Users\gabri\Downloads\victory-data\discord_app_id.txt";
-        private const string Motor1Ps1 = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-klbf-lab39.ps1";
-        private const string Motor2Ps1 = @"C:\Users\gabri\Downloads\victory-klbf-lab39\run-gleaf-ka1qux.ps1";
-        private const string Motor1PrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-KLBF-Lab39-AMD.bat";
-        private const string Motor2PrecompileBat = @"C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\PreCompilar-Shaders-GLeaf-Ka1qux-AMD.bat";
+        private static readonly string DownloadsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        private static readonly string RepoDir = Path.Combine(DownloadsDir, "victory-klbf-lab39");
+        private static readonly string GLeafDir = Path.Combine(DownloadsDir, "victory-gleaf6");
+        private static readonly string BackupsDir = Path.Combine(DownloadsDir, "victory-backups");
+        private static readonly string DataDir = Path.Combine(DownloadsDir, "victory-data");
+        private static readonly string ConfigPath = Path.Combine(DataDir, "launcher-config.ini");
+        private static readonly string DiscordIdPath = Path.Combine(DataDir, "discord_app_id.txt");
+        private static readonly string Motor1Ps1 = Path.Combine(RepoDir, "run-klbf-lab39.ps1");
+        private static readonly string Motor2Ps1 = Path.Combine(RepoDir, "run-gleaf-ka1qux.ps1");
+        private static readonly string GameDir = Path.Combine(DownloadsDir, "GTA6.Xbox.v1.0.2.1-CYBERLEEK");
+        private static readonly string Motor1PrecompileBat = Path.Combine(GameDir, "PreCompilar-Shaders-KLBF-Lab39-AMD.bat");
+        private static readonly string Motor2PrecompileBat = Path.Combine(GameDir, "PreCompilar-Shaders-GLeaf-Ka1qux-AMD.bat");
 
         private readonly List<BuildEntry> _m1Builds = new List<BuildEntry>();
         private readonly List<BuildEntry> _m2Builds = new List<BuildEntry>();

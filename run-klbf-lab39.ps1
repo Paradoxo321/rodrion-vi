@@ -26,16 +26,18 @@
     [switch]$CpuGpuBoost
 )
 
-$RepoDir = "C:\Users\gabri\Downloads\victory-klbf-lab39"
-$GameExe = "C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
+$DownloadsDir = Join-Path $env:USERPROFILE "Downloads"
+$DataDir = Join-Path $DownloadsDir "victory-data"
+$RepoDir = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $DownloadsDir "victory-klbf-lab39" }
+$GameExe = Join-Path $DownloadsDir "GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
 $Exe = if ($ExePath -and (Test-Path $ExePath)) { $ExePath } else { Join-Path $RepoDir "target\release\victory.exe" }
-$FfxDir = "C:\Users\gabri\Downloads\victory-data\ffx-sdk-2.4"
-$CacheDir = "C:\Users\gabri\Downloads\victory-data\cache-klbf-lab39"
+$FfxDir = Join-Path $DataDir "ffx-sdk-2.4"
+$CacheDir = Join-Path $DataDir "cache-klbf-lab39"
 $SkipFile = Join-Path $RepoDir "docs\klbf\skip-amd.txt"
 $Console = if ($SeriesX) { "series-x" } else { "series-s" }
 $ResTag = if ($Res720p) { "720p" } else { "1080p" }
 $Tag = if ($SeriesX) { "unificado-sx-$ResTag" } elseif ($FrameGen) { "unificado-ss-fg-$ResTag" } elseif ($SimpleUpscale) { "unificado-ss-$ResTag" } else { "unificado-ss-fsr-$ResTag" }
-$LogFile = "C:\Users\gabri\Downloads\victory-data\run-$Tag.log"
+$LogFile = Join-Path $DataDir "run-$Tag.log"
 $HudScript = Join-Path $RepoDir "victory-hud.py"
 
 if (-not (Test-Path $Exe)) {

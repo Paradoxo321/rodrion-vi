@@ -5,7 +5,7 @@
 //! Configuration (opt-in, controllable from GTA6-Launcher):
 //! - `VICTORY_DISCORD=1` (or `FLAMINGO_DISCORD=1`) enables presence (`0` disables).
 //! - `VICTORY_DISCORD_APP_ID=<id>` (or `FLAMINGO_DISCORD_APP_ID=<id>`), or saved in
-//!   `C:\Users\gabri\Downloads\victory-data\discord_app_id.txt` or
+//!   `%USERPROFILE%\Downloads\victory-data\discord_app_id.txt` or
 //!   `%LOCALAPPDATA%\victory\discord_app_id.txt`.
 //! - `VICTORY_DISCORD_HIDE_TITLE=1` (or `FLAMINGO_DISCORD_HIDE_TITLE=1`) omits the title name.
 
@@ -67,8 +67,14 @@ fn app_id() -> Option<String> {
         .ok()
         .or_else(|| std::env::var("FLAMINGO_DISCORD_APP_ID").ok())
         .or_else(|| {
-            std::fs::read_to_string(r"C:\Users\gabri\Downloads\victory-data\discord_app_id.txt")
-                .ok()
+            let home = std::env::var_os("USERPROFILE")?;
+            std::fs::read_to_string(
+                Path::new(&home)
+                    .join("Downloads")
+                    .join("victory-data")
+                    .join("discord_app_id.txt"),
+            )
+            .ok()
         })
         .or_else(|| {
             let dir = std::env::var_os("LOCALAPPDATA")?;

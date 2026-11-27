@@ -10,18 +10,20 @@ param(
     [double]$Ambient = 0.4
 )
 
-$GLeafDir = "C:\Users\gabri\Downloads\victory-gleaf6"
-$LabDir   = "C:\Users\gabri\Downloads\victory-klbf-lab39"
-$GameExe  = "C:\Users\gabri\Downloads\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
+$DownloadsDir = Join-Path $env:USERPROFILE "Downloads"
+$DataDir  = Join-Path $DownloadsDir "victory-data"
+$GLeafDir = Join-Path $DownloadsDir "victory-gleaf6"
+$LabDir   = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $DownloadsDir "victory-klbf-lab39" }
+$GameExe  = Join-Path $DownloadsDir "GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe"
 $Exe      = Join-Path $GLeafDir "target\release\victory.exe"
-$FfxDir   = "C:\Users\gabri\Downloads\victory-data\ffx-sdk-2.4"
-$CacheDir = "C:\Users\gabri\Downloads\victory-data\cache-gleaf-ka1qux"
+$FfxDir   = Join-Path $DataDir "ffx-sdk-2.4"
+$CacheDir = Join-Path $DataDir "cache-gleaf-ka1qux"
 $HudScript = Join-Path $LabDir "victory-hud.py"
 
 $Console = if ($SeriesX) { "series-x" } else { "series-s" }
 $Res = if ($Res720p) { "1280x720" } else { "1920x1080" }
 $Tag = if ($SeriesX) { "gleaf-ka1qux-sx-$Res" } elseif ($FrameGen) { "gleaf-ka1qux-ss-fg-$Res" } else { "gleaf-ka1qux-ss-fsr-$Res" }
-$LogFile = "C:\Users\gabri\Downloads\victory-data\run-$Tag.log"
+$LogFile = Join-Path $DataDir "run-$Tag.log"
 
 if (-not (Test-Path $Exe)) {
     Write-Host "Build release GLeaf-6 nao encontrado em $Exe" -ForegroundColor Red

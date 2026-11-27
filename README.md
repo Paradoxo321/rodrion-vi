@@ -16,17 +16,21 @@
 
 ## Real-World Benchmarks (RX 6600 8 GB + Ryzen 5 4500)
 
-Tested on **Windows 11**, **AMD Radeon RX 6600 8 GB** (**Above 4G Decoding + SAM / ReBAR enabled**, `TiledResourcesTier = 4`, native RDNA 2 Wave64), **AMD Ryzen 5 4500 (6C/12T, 8 MB L3)**, and **16 GB DDR4** — **Series S + FSR 2.4 (720p)** mode:
+Tested on **Windows 11**, **AMD Radeon RX 6600 8 GB** (**Above 4G Decoding + SAM / ReBAR enabled**, `TiledResourcesTier = 4`, native RDNA 2 Wave64), **AMD Ryzen 5 4500 (6C/12T, 8 MB L3)**, and **16 GB DDR4** — **Series S + FSR 2.4 + FrameGen (720p)** mode, **0 crashes / 0 TDRs / 0 panics**:
 
-| Metric | Measured Result (Open World) | Notes |
-|---|---|---|
-| **Real FPS (~2,000–4,300 draws/frame)** | **4.5 – 5.9 FPS** (`168 – 222 ms/frame`) | CPU-bound on Ryzen 5 4500; pause menu at **28.5 FPS** (`35 ms`) |
-| **Real FPS (heavy ~5,000–6,000 draws/frame)** | **3.8 – 4.9 FPS** (`205 – 263 ms/frame`) | Before optimizations + SAM: `2.6 – 2.8 FPS` (`352 – 381 ms`) |
-| **Perceived fluidity with AMD FSR FrameGen** | **~8 – 12 displayed FPS** | Uses RX 6600 headroom with no loss of real FPS |
-| **GPU time (RX 6600)** | **4.7 – 15.7 ms/frame** (~51% busy) | Native RDNA shaders (`rdna=true`, `compute=64`) |
-| **VRAM usage (RX 6600 8 GB)** | **5.5 GB / 6.7 GB** (~1.2 GB free) | **0 evictions/s** (previously 182 evictions/s & 52 GB re-uploads) |
-| **Tiled Physical-Page Pool (`VICTORY_TILED_POOL=1`)** | **739–822 windows (3.5–4.2 GB virtual) in ~1.15 GB physical** | **50.5% RAM saved** via `NULL` hole tiles, zero `device removed` |
-| **GPU offload with SAM/ReBAR (`rebar_hw=true`)** | **239 copies (1,110 MB) in VRAM** • **380 hash + 125 compare passes/frame on GPU** | CPU write-compare cut by **87%** (`17.3 MB` → `2.2 MB`; CPU buffers: `0.0 MB`) |
+| Version | Overall Median Frametime | Real FPS (Med) | Presented FPS w/ FrameGen | 2,000–4,000 draws | 8,000+ draws | Key Changes |
+|---|---|---|---|---|---|---|
+| **v1.2.0** | `282.8 ms` | `~3.5 FPS` | `~7.0 FPS` | — | — | CPU↔GPU Boost baseline (`BATCH_RANGE_FLUSH`, `WATCH_READ_FAST`, `GUARD_ABSENT_FAST`, `TILED_LOCK_BATCH`, `COPY_ON_GPU`, `CARD_SYNC_INLINE`) |
+| **v1.3.0** | `167.7 ms` | `6.0 FPS` | `12.3 FPS` | `150.8 ms` | — | `VICTORY_HEAP_RECORD_FAST=1` + `VICTORY_TEXTURE_ADAPTIVE=1` (`heap_textures` 24.8 → 5.4 ms) |
+| **v1.4.0** | `180.7 ms` | `5.5 FPS` | `11.8 FPS` | `150.3 ms` | — | 64-sharded `Notes` (`VICTORY_PORT_JOURNAL=1`) + `VICTORY_WATCH_UNLOCKED_ASK=1` + pipeline worker panic recovery |
+| **v1.5.0** | `152.9 ms` | `6.5 FPS` | `13.7 FPS` | `137.9 ms` | `459.3 ms` | `VICTORY_TABLE_MEMO=1` (81–84.5% hits on ~87k–145k table entries/frame) |
+| **v1.6.0** | **`125.2 ms`** (`p10 93.0`) | **`8.0 FPS`** (`p90 10.8`) | **`16.9 FPS`** | **`119.1 ms`** (`8.4 FPS`) | **`265.2 ms`** (`−42%`) | `LOOSE` `RwLock`, `VICTORY_PORT_CONSTANTS=1` (185 MB 32-bit heap in-place), `VICTORY_REFRESH_COALESCE=1`, `VICTORY_ROOT_REACH_MS=1000` |
+
+### v1.6.0 Scene Density Breakdown (Open World)
+- **100 – 2,000 draws:** `86.8 ms` (**11.6 FPS real** / ~23 FPS FG)
+- **2,000 – 4,000 draws:** `119.1 ms` (**8.4 FPS real** / ~17 FPS FG)
+- **4,000 – 8,000 draws:** `187.1 ms` (**5.3 FPS real** / ~11 FPS FG)
+- **8,000+ draws:** `265.2 ms` (**3.8 FPS real** — `heap_buffers` cut from `200.7 ms` → `75.1 ms`, −63%)
 
 ---
 
@@ -48,17 +52,19 @@ Tested on **Windows 11**, **AMD Radeon RX 6600 8 GB** (**Above 4G Decoding + SAM
 - `QuadRead` helper-lane fixes (resolves artifacts on paint, glass, and skin on AMD), 9-bit mesh primitive indices, and 100% fingerprint parity between offline shader pre-compilation and runtime (`pipeline/host.rs`).
 - Extended root-view windowing (`VICTORY_ROOT_WINDOW_MB=12`) preventing `device removed` faults.
 
-### 4. CPU Hot-Path Optimizations
-- **Fast 4-lane `u64` texture hashing (`fast_hash64`):** replaces cryptographic `BLAKE3` for texture change detection (~6–8x faster) + configurable `VICTORY_TEXTURE_HASH_EVERY=32`.
-- **Persistent worker pool (`wide_run`)** for texture refreshes (`texture.rs`), parallel Tiled Pool `find_all` comparisons (`shadow.rs`), and coarse-chunked `Batch::flush` (`host.rs`).
-- **Vectorized `back_piece` & `changed_runs` (32/8-byte skips)** without redundant zero-fills.
+### 4. CPU Hot-Path & Sync Optimizations (v1.2.0 – v1.6.0)
+- **64-sharded write-watch journal (`VICTORY_PORT_JOURNAL=1`)** + lock-free read-fast / guard-absent paths (`VICTORY_WATCH_READ_FAST=1`, `VICTORY_GUARD_ABSENT_FAST=1`, `VICTORY_WATCH_UNLOCKED_ASK=1`).
+- **Per-command-list descriptor table memoization (`VICTORY_TABLE_MEMO=1`)** — 81–84.5% hit rate across ~87k–145k descriptor table entries per frame.
+- **32-bit graphics heap in-place (`VICTORY_PORT_CONSTANTS=1`)** + `LOOSE` `RwLock` + **`Step::Refresh` coalescing (`VICTORY_REFRESH_COALESCE=1`)** + **`VirtualQuery` reach cache (`VICTORY_ROOT_REACH_MS=1000`, 98.8% hit rate)**.
+- **Fast 12-byte `[tag, i, gen]` heap buffer pass (`VICTORY_HEAP_RECORD_FAST=1`)**, adaptive texture upload budget (`VICTORY_TEXTURE_ADAPTIVE=1`), and lock-free Tiled Pool sync (`VICTORY_TILED_LOCK_BATCH=1`).
+- **Fast 4-lane `u64` texture hashing (`fast_hash64`)**, persistent worker pool (`wide_run`), and vectorized `back_piece` & `changed_runs`.
+- **Pipeline worker panic recovery** (`pipeline/make.rs`) ensuring shader worker panics never stall submission threads.
 
-### 5. Custom Launcher, Controls & Quality of Life (`launcher/Program.cs`)
-- **Customizable Xbox → Keyboard remapper (`VICTORY_KEYMAP`):** interactive UI to rebind all 24 Xbox buttons/axes (e.g. `X = K`) with automatic conflict resolution.
-- **Mouse Camera (`VICTORY_MOUSE_CAMERA=1`)** with adjustable sensitivity, Y-axis invert, and aim/shoot mouse button presets (`F9` toggles mouse capture).
-- **Click-to-hide mouse cursor** inside the game window (`lifecycle.rs`), automatically restored on `F9` or `Alt+Tab`.
-- **Unified Memory vs Classic AMD Mode toggle** (`-NoUnifiedMemory`) and **Lite Graphics Mode** (`-LiteGraphics`, `VICTORY_LITE_GFX=1`, `VICTORY_AMBIENT=0.2`).
-- Support for **AMD FSR 2.4** and **AMD FSR Frame Generation** (FidelityFX SDK 2.4).
+### 5. Custom Launcher, Controls, Discord RPC & Quality of Life (`launcher/Program.cs`)
+- **Dual-engine & version selector** (Motor 1 / Motor 2) with PT-BR / EN-US language toggle.
+- **Discord Rich Presence (`VICTORY_DISCORD=1`)** over local Discord IPC pipe with zero extra crates.
+- **Customizable Xbox → Keyboard remapper (`VICTORY_KEYMAP`)**, **Mouse Camera (`VICTORY_MOUSE_CAMERA=1`)**, and click-to-hide cursor (`F9` toggle).
+- **CPU↔GPU Boost toggle**, **Unified Memory vs Classic AMD Mode**, **Lite Graphics Mode**, and **AMD FSR 2.4 + Frame Generation**.
 
 ---
 
@@ -112,7 +118,10 @@ This project is an experimental fork of **VIctory** licensed under **GPL-3.0** (
 - **[YukiRyuu/VIctory-7900XT](https://github.com/YukiRyuu/VIctory-7900XT)** — native RDNA shader translator (`set_host_rdna`, `VICTORY_RDNA_FLOAT`, QuadRead helper lanes, 9-bit mesh indices), `root_window` (`VICTORY_ROOT_WINDOW_MB`), and AMD optimizations.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)** — `VICTORY_DYNAMIC_SLOTS`, `VICTORY_MERGE_DWORDS`, `VICTORY_PIPELINE_GATE_S`, partial mip streaming, and >65,535-group dispatch splitting.
 - **[GPUOpen-LibrariesAndSDKs/FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)** — AMD FidelityFX SDK 2.4 (FSR + Frame Generation).
-- **rorodev6 / shadowdog00** — `VICTORY_LATE_WAIT=3`, `VICTORY_TEXTURE_BATCH`, and `VICTORY_GROUPED_MESH_CLAMP`.
+- **rorodev6 / shadowdog00 & [rorodev6/victory-megafork-amd](https://github.com/rorodev6/victory-megafork-amd)** — `VICTORY_LATE_WAIT=3`, `VICTORY_TEXTURE_BATCH`, `VICTORY_GROUPED_MESH_CLAMP`, Port 7 64-sharded journal (`VICTORY_PORT_JOURNAL`), and pipeline worker panic recovery.
+- **[Op-lite/victory-scarlett](https://github.com/Op-lite/victory-scarlett)** — `VICTORY_TABLE_MEMO` (per-list descriptor table memoization) and `CARD_AWAKE=0` tuning.
+- **[gleaf-6/VIctory-7900XTX-](https://github.com/gleaf-6/VIctory-7900XTX-)** — `LOOSE` `RwLock`, `VICTORY_PORT_CONSTANTS`, `VICTORY_REFRESH_COALESCE`, and `VICTORY_ROOT_REACH_MS`.
+- **realblastex/flamingo** — Discord Rich Presence local IPC integration (`apps/victory/src/discord.rs`).
 - **ShakiraRED** — `VICTORY_COPY_PLAIN`, `VICTORY_WRITE_PLAIN`, and `VICTORY_STAGING_POOL`.
 - **Trexies** — `VICTORY_CLAMP_WAITS=0` (removing global UAV stalls on indirect clamps).
 - **triippywhale** — AMD view-heap clamping and dynamic descriptor slot scaling.
